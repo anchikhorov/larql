@@ -39,8 +39,12 @@ tokio-stream = "0.1"
 tonic = "0.13"
 prost = "0.13"
 async-stream = "0.3"
+bytes = "1"
 futures = "0.3"
 rayon = "1.10"
+# tar — used by /v1/shard route for Mode B handoff and shard_loader for the
+# matching client unpack path. Pure-Rust; no system dep.
+tar = "0.4"
 tower = { version = "0.5", features = ["limit"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
@@ -55,6 +59,11 @@ thiserror = { workspace = true }
 base64 = "0.22"
 utoipa = { version = "5", features = ["axum_extras", "preserve_order"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Integration test wires a real GridServiceImpl alongside the server. Dev-only.
+larql-router = { path = "../larql-router" }
 
 [features]
 default = []

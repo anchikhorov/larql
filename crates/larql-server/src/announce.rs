@@ -51,11 +51,22 @@ pub struct AnnounceConfig {
     pub latency_tracker: Arc<LayerLatencyTracker>,
     /// Active request counter — used for drain (GT6) and heartbeat.requests_in_flight.
     pub requests_in_flight: Arc<std::sync::atomic::AtomicU32>,
+    /// GT6: when set, after `UnassignMsg` + drain + `DroppingMsg`, the server
+    /// re-enters Mode B on the same gRPC stream using this config so the
+    /// router can immediately reassign it to a different gap.
+    ///
+    /// The reassignment downloads the new shard via `shard_loader` into
+    /// `store_path`, but the running process does not hot-swap its loaded
+    /// vindex — a deployer-side restart is required for the new shard to
+    /// actually serve. The protocol round-trip nonetheless completes, which
+    /// is what the rebalancer needs to see.
+    pub available_after_drain: Option<AvailableConfig>,
 }
 
 // ── Mode B config ──────────────────────────────────────────────────────────────
 
 /// Config for Mode B announce: server has capacity but no shard loaded.
+#[derive(Clone)]
 pub struct AvailableConfig {
     pub join_url: String,
     pub listen_url: String,
@@ -127,6 +138,33 @@ pub fn run_announce_available(config: AvailableConfig) {
             }
         }
     });
+}
+
+/// Build the `available_after_drain` config that lets a Mode A server
+/// re-enter the available pool when the rebalancer asks it to drain.
+///
+/// Returns `None` when `--available-ram` is unset (the deployer hasn't
+/// opted in) or when the RAM string fails to parse. `join_url` is left
+/// empty here because bootstrap clones the config per router and fills
+/// the field per iteration of its join-list loop.
+pub fn build_available_after_drain(
+    available_ram_bytes: Option<u64>,
+    listen_url: &str,
+    vindex_store: Option<&str>,
+    grid_key: Option<&str>,
+) -> Option<AvailableConfig> {
+    let ram_bytes = available_ram_bytes?;
+    let store_path = vindex_store
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "/tmp/larql-shards".to_string());
+    Some(AvailableConfig {
+        join_url: String::new(),
+        listen_url: listen_url.to_string(),
+        ram_bytes,
+        disk_bytes: 0,
+        store_path,
+        grid_key: grid_key.map(str::to_string),
+    })
 }
 
 /// Stable hash of the vindex identity (not a security primitive — for version checks).
@@ -210,7 +248,13 @@ async fn drain_requests(counter: &std::sync::atomic::AtomicU32, timeout: Duratio
 
 // ── Single connection lifecycle ────────────────────────────────────────────────
 
-async fn try_once(cfg: &AnnounceConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Run one announce connection to completion. Public so integration tests
+/// can drive the real production flow against an in-process router. Production
+/// code should use `run_announce` instead, which wraps this with reconnect.
+#[doc(hidden)]
+pub async fn try_once(
+    cfg: &AnnounceConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel = tonic::transport::Channel::from_shared(cfg.join_url.clone())?
         .connect()
         .await?;
@@ -283,7 +327,7 @@ async fn try_once(cfg: &AnnounceConfig) -> Result<(), Box<dyn std::error::Error 
                     // GT6 drain: wait up to DRAIN_TIMEOUT for active requests
                     // to finish before sending DroppingMsg.
                     drain_requests(&cfg.requests_in_flight, DRAIN_TIMEOUT).await;
-                    // Send dropping notice then let the stream close.
+                    // Send dropping notice.
                     let _ = tx
                         .send(dropping_message(
                             u.model_id.clone(),
@@ -291,7 +335,15 @@ async fn try_once(cfg: &AnnounceConfig) -> Result<(), Box<dyn std::error::Error 
                             u.layer_end,
                         ))
                         .await;
-                    break;
+                    hb_handle.abort();
+                    // GT6 §Phase B2: if the deployer enabled drain-to-available,
+                    // keep the stream open and re-enter Mode B so the router
+                    // can immediately reassign this server.
+                    if let Some(avail) = &cfg.available_after_drain {
+                        info!("Drain complete — re-entering Mode B available pool on same stream");
+                        return run_available_loop(tx, inbound, avail).await;
+                    }
+                    return Ok(());
                 }
                 None => {}
             },
@@ -307,8 +359,6 @@ async fn try_once(cfg: &AnnounceConfig) -> Result<(), Box<dyn std::error::Error 
 async fn try_once_available(
     cfg: &AvailableConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use larql_router_protocol::{AvailableMsg, ReadyMsg};
-
     let channel = tonic::transport::Channel::from_shared(cfg.join_url.clone())?
         .connect()
         .await?;
@@ -325,9 +375,24 @@ async fn try_once_available(
     let (tx, rx) = tokio::sync::mpsc::channel::<ServerMessage>(32);
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
     let response = client.join(outbound).await?;
-    let mut inbound = response.into_inner();
+    let inbound = response.into_inner();
 
-    // Send AvailableMsg — advertise capacity.
+    run_available_loop(tx, inbound, cfg).await
+}
+
+/// Shared Mode B loop — used by `try_once_available` (fresh connection) and
+/// by `try_once` after drain (re-enters Mode B on an existing connection).
+///
+/// Sends `AvailableMsg`, then handles incoming `AssignMsg` by downloading the
+/// shard via `shard_loader` and acknowledging with `ReadyMsg` (or
+/// `RefuseMsg` on download failure).
+async fn run_available_loop(
+    tx: tokio::sync::mpsc::Sender<ServerMessage>,
+    mut inbound: tonic::Streaming<larql_router_protocol::RouterMessage>,
+    cfg: &AvailableConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use larql_router_protocol::{AvailableMsg, ReadyMsg, RefuseMsg};
+
     tx.send(ServerMessage {
         payload: Some(ServerPayload::Available(AvailableMsg {
             ram_bytes: cfg.ram_bytes,
@@ -343,7 +408,6 @@ async fn try_once_available(
         "Mode B: sent AvailableMsg — waiting for assignment…"
     );
 
-    // Wait for AssignMsg from router.
     while let Some(msg) = inbound.next().await {
         match msg {
             Err(e) => return Err(e.into()),
@@ -356,7 +420,6 @@ async fn try_once_available(
                         "Mode B: received AssignMsg — downloading shard…"
                     );
 
-                    // Download the assigned shard.
                     match crate::shard_loader::download_and_load_shard(
                         &assign.origin_url,
                         &cfg.store_path,
@@ -368,7 +431,6 @@ async fn try_once_available(
                     .await
                     {
                         Ok(()) => {
-                            // Send ReadyMsg — shard is loaded and serving.
                             let _ = tx
                                 .send(ServerMessage {
                                     payload: Some(ServerPayload::Ready(ReadyMsg {
@@ -385,7 +447,6 @@ async fn try_once_available(
                             );
                         }
                         Err(e) => {
-                            use larql_router_protocol::RefuseMsg;
                             warn!("Mode B: shard download failed: {e} — sending RefuseMsg");
                             let _ = tx
                                 .send(ServerMessage {
@@ -430,6 +491,7 @@ mod tests {
             vindex_hash: "abc123".into(),
             latency_tracker: Arc::new(LayerLatencyTracker::new()),
             requests_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            available_after_drain: None,
         }
     }
 
@@ -493,6 +555,36 @@ mod tests {
         assert_eq!(hb.layer_stats.len(), 1);
         assert_eq!(hb.layer_stats[0].layer, 5);
         assert!(hb.layer_stats[0].avg_ms > 0.0);
+    }
+
+    #[test]
+    fn build_available_after_drain_returns_none_without_ram() {
+        assert!(build_available_after_drain(None, "http://srv", None, None).is_none());
+    }
+
+    #[test]
+    fn build_available_after_drain_uses_default_store_path() {
+        let cfg =
+            build_available_after_drain(Some(8 * 1024 * 1024 * 1024), "http://srv", None, None)
+                .expect("ram set should produce a config");
+        assert_eq!(cfg.ram_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.listen_url, "http://srv");
+        assert_eq!(cfg.store_path, "/tmp/larql-shards");
+        assert!(cfg.join_url.is_empty(), "filled per-router by bootstrap");
+        assert!(cfg.grid_key.is_none());
+    }
+
+    #[test]
+    fn build_available_after_drain_passes_through_overrides() {
+        let cfg = build_available_after_drain(
+            Some(1),
+            "http://srv",
+            Some("/mnt/shards"),
+            Some("secret"),
+        )
+        .unwrap();
+        assert_eq!(cfg.store_path, "/mnt/shards");
+        assert_eq!(cfg.grid_key.as_deref(), Some("secret"));
     }
 
     #[test]

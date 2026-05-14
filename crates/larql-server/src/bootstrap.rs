@@ -1009,6 +1009,17 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
             }
         }
 
+        // If the deployer supplied --available-ram alongside a loaded model,
+        // build a reusable Mode B fallback config so the server re-enters the
+        // available pool after a drain instead of just disconnecting (GT6
+        // §Phase B2). The construction logic + tests live in `announce.rs`.
+        let available_after_drain = announce::build_available_after_drain(
+            cli.available_ram.as_deref().and_then(|s| parse_ram_bytes(s).ok()),
+            &listen_url,
+            cli.vindex_store.as_deref(),
+            cli.grid_key.as_deref(),
+        );
+
         for m in &models {
             let (layer_start, layer_end) = match layer_range {
                 Some((s, e)) => (s as u32, (e - 1) as u32),
@@ -1016,6 +1027,11 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
             };
             let vhash = announce::vindex_identity_hash(&m.id, m.config.num_layers);
             for join_url in &join_urls {
+                let avail = available_after_drain.as_ref().map(|base| {
+                    let mut a = base.clone();
+                    a.join_url = join_url.clone();
+                    a
+                });
                 announce::run_announce(announce::AnnounceConfig {
                     join_url: join_url.clone(),
                     model_id: m.id.clone(),
@@ -1027,6 +1043,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                     vindex_hash: vhash.clone(),
                     latency_tracker: m.layer_latency_tracker.clone(),
                     requests_in_flight: m.requests_in_flight.clone(),
+                    available_after_drain: avail,
                 });
             }
         }
