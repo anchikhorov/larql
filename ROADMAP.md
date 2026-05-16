@@ -289,6 +289,7 @@ item, not just a competitive-parity item.
 - **Positioning vs ollama / vLLM / llama.cpp documented** (2026-05-09): [docs/positioning.md](docs/positioning.md). Three-category framing (local single-user / batched serving / research+edit); feature matrix; per-competitor gap analysis; surfaces missing items now tracked under P2 § "Competitive parity" below.
 - **Google released Gemma 4 MTP drafters** (2026-05-05, 4 days ago): `google/gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant` — every Gemma 4 variant LARQL supports. 0.4B BF16 ~4-layer drafter for the 26B-A4B target. Architecture: shared input embeddings + shared KV cache + target last-layer activations concatenated with token embeddings then down-projected to drafter dimension. Measured **2.2× decode speedup on Apple Silicon at speculative batch 4–8** (Google blog), up to 3× generally. Apache 2.0 / CC-BY-4.0. Supported engines: HF Transformers, MLX, vLLM, SGLang, **Ollama**, LiteRT-LM (notably not llama.cpp). Competitive implication: the LARQL gap on Gemma 4 widens from 1.17× to ~2.6× as users adopt MTP on Ollama. Red Hat AI also released an EAGLE-3 speculator for `gemma-4-26B-A4B-it` (0.9B drafter). MTP1 promoted from P2 to **P1** — see new section below.
 - **ADR-019 resolved** (2026-05-09): substrate-primary is **Gemma 4 31B dense + vindex**; MoE coverage retained at single-machine scale (Gemma 4 26B-A4B for cross-arch validation, virtual-expert work). Multi-machine MoE grid (C9 productionisation, critical-path items 5–10) demoted from P0 to P2 — substantial production-engineering work with no current experiment requiring "model spans 4 consumer machines" beyond what single-machine sharding already demonstrates. C1 (CPU MoE forward pass) stays P0 because V1/V2 cross-arch sweep on 26B-A4B requires it. See full resolution in "ADR-019" section below.
+- **Engine ↔ Backend unification PR shippable** (2026-05-16): three specs landed in `crates/larql-inference/docs/specs/` — (1) [`kv-engine-unification.md`](crates/larql-inference/docs/specs/kv-engine-unification.md) (Steps 1-7 implemented, all parity tests green); (2) [`compute-backend-redesign.md`](crates/larql-inference/docs/specs/compute-backend-redesign.md) (Steps 1-4 implemented — `KvDispatch` sibling trait in larql-inference, `EngineBackend` umbrella, `CpuBackend`/`MetalBackend` scaffolding, `StandardEngine` migrated to dispatch through trait); (3) [`async-compute-backend.md`](crates/larql-inference/docs/specs/async-compute-backend.md) (trait surface locked, 6 open questions resolved, implementation pending). Honest finding from Step 5 discovery: per-layer Metal kernels at the sync trait's granularity are *slower* than today's fused decode path because each per-layer call forces a separate GPU command-buffer commit — `AsyncComputeBackend` (intent-collector pattern, deferred dispatch) is the prerequisite for any tok/s win. That work is 6-12 months end-to-end (see new "P0 — Engine ↔ Backend unification" section below). The unification PR ships the foundation; tok/s wins land in the multi-step Metal kernel work that compounds on top.
 - **Cross-engine forward-pass correctness gate** (2026-05-16): `larql shannon verify` orchestrates LARQL Rust forward against HF/PyTorch + MLX reference scorers (subprocesses) on a shared corpus and prints a bits/char delta table. First serious application surfaced **four config-loading bugs in larql-models** — all closed in the loader (no env-var workarounds in production): (1) `rms_norm_eps` from config.json was never read by the trait default; (2) Gemma 3's per-layer-type `rope_scaling` structured form (`{full_attention: {rope_type: linear, factor: 8}, sliding_attention: {rope_type: default}}`) wasn't honoured; (3) `rope_scaling = llama3` (wavelength-dependent per-channel `inv_freq` adjustment) wasn't implemented; (4) `norm_epsilon` alias (StarCoder2's name for `rms_norm_eps`) wasn't recognised. Post-fix, all four affected models match HF F32 to <0.06% bits/char with zero env vars. `scripts/diagnose_models.py` (multi-arch sweep) reports 7/9 PASS. CI gate at `.github/workflows/shannon-verify.yml` runs SmolLM2-135M verify on every PR. Diagnostic doc: [`docs/diagnoses/shannon-cross-engine-divergence.md`](docs/diagnoses/shannon-cross-engine-divergence.md). Plus GPT-2 legacy config-key aliases (`n_embd`/`n_layer`/`n_head`/`n_inner`) parsed via new alias-list machinery in `detect/config_io.rs`.
 
 ---
@@ -618,6 +619,72 @@ verify.
 
 ---
 
+## P0 — Engine ↔ Backend unification (specs landed 2026-05-16)
+
+Driver: today's `KvEngine` (in `larql-kv`) and `ComputeBackend` (in
+`larql-compute`) are unaware of each other. The four research KV engines
+(MarkovRS, UnlimitedContext, TurboQuant, Apollo) live in research-only
+bench paths; the production decode loop bypasses them. And every backend
+(CPU, Metal, future Vulkan/CUDA) hides under a single trait that doesn't
+let engines express *intents* (windowed attention, K/V recompute,
+boundary upload) — only flat compute primitives (matmul, softmax). The
+net effect: engine-aware kernel fusion, compute-aware engine selection,
+and per-engine prefill graphs are all foreclosed today.
+
+Three landed specs in `crates/larql-inference/docs/specs/`:
+
+- [`kv-engine-unification.md`](crates/larql-inference/docs/specs/kv-engine-unification.md)
+  — KvEngine trait + dispatch in `larql-inference`; `larql-kv` ships
+  six engines (`Standard`, `NoCache`, `MarkovResidual`,
+  `UnlimitedContext`, `TurboQuant`, `Apollo`).
+- [`compute-backend-redesign.md`](crates/larql-inference/docs/specs/compute-backend-redesign.md)
+  — `KvDispatch` sibling trait in `larql-inference` (intent-based
+  per-layer surface); `EngineBackend: ComputeBackend + KvDispatch`
+  umbrella; engines hold `Box<dyn EngineBackend>`.
+- [`async-compute-backend.md`](crates/larql-inference/docs/specs/async-compute-backend.md)
+  — `AsyncComputeBackend: ComputeBackend + KvDispatch` sibling trait
+  (deferred dispatch / intent-collector / handle-based). Required for
+  any GPU performance at per-layer intent granularity. Trait surface
+  locked; implementation pending.
+
+Honest scope: the unification PR is shippable today. The tok/s wins
+require the multi-month AsyncComputeBackend implementation (Steps A1–A8
+in the spec). Expect 6–12 months end-to-end before per-layer Metal
+beats today's fused `decode_token` path.
+
+| ID | Item | Crate(s) | Status | Notes |
+|----|------|----------|--------|-------|
+| U1 | KV engine unification — Steps 1–7 | larql-inference, larql-kv, larql-cli | **shipped 2026-05-16** | `KvEngine` trait + EngineInfo + DecodeStageSummary in `larql-inference::kv_engine`; `larql-kv` re-exports. `Standard` + `NoCache` engines added. `larql run` / `larql walk` route through engine dispatch (default `--kv-cache standard` = `Standard { window_size: None }`, bit-parity gated). `--engine SPEC` + `LARQL_KV_ENGINE` env var on run/walk. Server wiring deferred to U7 (server uses fused `decode_token` and would silently downgrade to CPU under sync dispatch). |
+| U2 | ComputeBackend redesign — Steps 1–4 | larql-inference, larql-compute | **shipped 2026-05-16** | `KvDispatch` trait in `larql-inference` (per-layer intents: cache, attention, engine-specific). `EngineBackend: ComputeBackend + KvDispatch` umbrella with blanket impl. `CpuBackend::KvDispatch` real implementation; `MetalBackend::KvDispatch` CPU-fallback scaffolding. `cpu_engine_backend()` / `default_engine_backend()` factories. 6 new `Capability` flags (`FusedAttentionStep`, `WindowedAttentionStep`, `NativeKvCodec`, `PipelinedBoundaryUpload`, `FusedResidualNorm`, `KvHandleNative`). |
+| U3 | ComputeBackend redesign — Step 3c (engine migration) | larql-kv | **shipped 2026-05-16** (partial) | All six engines accept `Box<dyn EngineBackend>` in constructors. `StandardEngine` fully migrated to `kv_prefill_via_dispatch` / `kv_decode_step_via_dispatch` (bit-parity tests pass). Other engines (`MarkovResidual`, etc.) have widened signatures but bodies still call legacy direct paths via `as_compute()` upcast — full migration happens alongside their U5 kernel work when each engine's specialised intents land. |
+| U4 | AsyncComputeBackend impl — Steps A1–A5 (the trait + foundation) | larql-inference, larql-compute | **spec'd, not started** | A1: trait + handle types (1 week). A2: `CpuBackend` async impl as `Ready<T>` wrapper (1 week, with parity tests). A3: `MetalBackend` async scaffolding (1 week). A4: `MetalBackend` real deferred dispatch — one `MTLCommandBuffer` per session, commit at engine checkpoints. **A4 is where the tok/s shape changes** (1 commit per decode step instead of N). 4–8 weeks. A5: per-engine opt-in via `with_async_backend` constructor (1–2 weeks per engine). |
+| U5 | AsyncComputeBackend impl — Step A6 (per-engine specialised shaders) | larql-compute, larql-kv | **spec'd, not started** | This is the tok/s payoff. Priority order: `attention_step_windowed` (the `standard:window=N` win), then engine-specific intents in order of impact — `markov-rs` Metal K/V recompute, `apollo` pipelined boundary upload, `turbo-quant` codec kernel. Each shader paired with a real-model bench. Ongoing — months of iterative work. |
+| U6 | AsyncComputeBackend impl — Step A7 (VulkanBackend) | larql-compute | **spec'd, not started** | Same trait shape as Metal, different primitives (`VkCommandPool`, semaphores, SPIR-V). Validates the multi-backend story is real, not Metal-shaped. 6–10 weeks. |
+| U7 | AsyncComputeBackend impl — Step A8 (CudaBackend) + server wiring | larql-compute, larql-server | **spec'd, not started** | CUDA streams map naturally to the deferred-dispatch shape — designed against it. Server wiring (deferred from `kv-engine-unification.md` §10.6) lands here: `larql-server`'s `handle_stream_generate` switches from direct `generate_streaming` to `generate_with_engine` against an `AsyncComputeBackend`, finally honouring `LARQL_KV_ENGINE` server-side. 6–10 weeks Cuda + 1–2 weeks server. |
+
+**Implementation order**: U1 ✅ → U2 ✅ → U3 ✅ → U4 → U5 (highest tok/s
+leverage, run continuously alongside U6/U7) → U6 → U7. U4 is the next
+critical-path commitment; until it lands, U5/U6/U7 are blocked.
+
+**Acceptance**:
+1. **Short-term** (U4 lands): engines that opt into async on Metal see
+   decode at ≥ today's fused-path tok/s (1 GPU sync per token, matched
+   cadence). No regression on default `StandardEngine` user-visible
+   behaviour.
+2. **Medium-term** (U5 lands `attention_step_windowed`): `standard:window=N`
+   decode at ≥ 1.5× today's `standard` Metal decode on Gemma 3 4B at
+   window=512. Per-shader bench artifact in `bench/baselines/cpu/` (or
+   `metal/` once we add it).
+3. **Long-term** (U5 covers `apollo` + `markov-rs`): long-context
+   workloads where Apollo's compressed path applies decode at ≥ 8×
+   today's Metal `standard` on Gemma 3 4B at 32k context. Requires
+   offline boundary-store preprocessing — separate work item.
+4. **Ultimate** (U6 + U7): same engine catalog runs on Vulkan
+   (consumer NVIDIA/AMD/Intel GPUs without Apple Silicon) and CUDA
+   (datacenter NVIDIA) with the same per-engine perf cliffs.
+
+---
+
 ## P0 — CPU path to blazing (the ultimate-aim track)
 
 Driver: the ultimate aim ("largest models at blazing speed on consumer
@@ -641,7 +708,7 @@ compression 10× = ~100×) make this ~134 ms/token — the actual
 | C4 | FP4 productisation (exp 26 → product) — native FP4 quantisation tier (`Q4_K → FP4`) | larql-vindex + larql-compute | research only | Exp 26 proved gemma3-4b-f16.vindex is 99.83% FP4-friendly per-feature without QAT (down is the tail at 99.65%). Add `Quantisation::FP4` variant; CPU-first kernel; Metal twin in larql-compute. ~2× memory shrink vs Q4_K. |
 | C5 | mmap'd vindex with lazy disk-resident edges — only resident pages for active edges per token | larql-vindex + larql-inference | not started | Today vindex loads whole layer tensors into RAM. For models bigger than RAM, mmap the vindex file and let the OS page in only the gate-KNN-resolved edges. Pairs with C2 and C3: when only 20% of edges fire, only those pages are read. |
 | C6 | AMX / AVX-512 / Apple AMX kernels for residual compute | larql-compute (CPU side) | partial — Accelerate BLAS, AMX through it | Current CPU path uses ndarray + Accelerate; promote to direct AMX intrinsics on Apple Silicon, AVX-512 on x86. Compute that *does* happen needs to be as good as it gets, since bandwidth is what's left over. |
-| C7 | KV compression as **default** for long context (Apollo / MarkovRS / UnlimitedContext / TurboQuant) | larql-inference | engines reachable on `run`/`walk` (CPU) via `--engine` / `LARQL_KV_ENGINE`; default still `standard` (production K/V cache); server wiring deferred to ComputeBackend redesign | Unification spec at `crates/larql-inference/docs/specs/kv-engine-unification.md` (steps 1-5 of 7 landed; step 6 partial — server defers until `KvEngine` has a GPU side). MarkovRS / UnlimitedContext / TurboQuant opt-in via `--engine`. Apollo bench-only (not yet wired into `run`/`walk`/server). Promoting any of them as default for long context requires the ComputeBackend redesign so engine choice translates to Metal/Vulkan/CUDA kernels, not just CPU dispatch. |
+| C7 | KV compression as **default** for long context (Apollo / MarkovRS / UnlimitedContext / TurboQuant) | larql-inference | engines reachable on `run`/`walk` (CPU) via `--engine` / `LARQL_KV_ENGINE`; default still `standard` (production K/V cache); GPU performance on opt-in engines requires AsyncComputeBackend (see U-series below) | Unification spec at [`kv-engine-unification.md`](crates/larql-inference/docs/specs/kv-engine-unification.md) — all 7 steps landed. MarkovRS / UnlimitedContext / TurboQuant opt-in via `--engine` (CPU-correct, Metal works via CPU-fallback delegation). Apollo bench-only. Promoting any of these as default for long context requires `AsyncComputeBackend` Step A6 (engine-specific Metal shaders) to land — see U5 below. Server engine wiring also blocked on AsyncComputeBackend (U7); without it the server would silently downgrade Metal decode to CPU. |
 | C8 | BR4 (Boundary refs Phase 4 — bounded KV eviction + durability-first capture) | larql-server + larql-inference | not started | See § "P1 — Boundary refs and cold-context storage" below. The CPU track makes BR4 load-bearing because long-context CPU inference can't keep raw KV in RAM. |
 | C9 | Distributed-load-balancing for "model spans 4 consumer machines" | larql-router + larql-server | shipped (grid + rebalancer) | **DEMOTED to P2 per ADR-019 (2026-05-09)** — substantial production-engineering with no current experiment requiring multi-machine. Single-shard grid (already shipped) sufficient for substrate. Re-promote if a specific experiment needs multi-machine. |
 | C10 | CPU bench harness — `larql bench --cpu` with per-stage breakdown matched against `llama.cpp -ngl 0` | larql-cli + bench/ | started — `larql bench --cpu --output json` is now a first-class shorthand; Gemma 3 4B Q4K vs llama.cpp Q4_K_M CPU baseline is recorded in `bench/baselines/cpu/`; current gap is ~114×, with ~92% in CPU full-prefix forward | CPU-track baseline-credibility threshold can't be enforced without this. First acceptance test: Gemma 3 4B Q4_K on M3 Max CPU vs quant-matched `llama.cpp -ngl 0`. Then Llama 2 7B + Mistral 7B for cross-arch CPU. |

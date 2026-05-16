@@ -996,9 +996,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, CacheError::InputShape { .. }));
 
-        let err = cache
-            .seed_from_normed(0, vec![], vec![], 0, 0)
-            .unwrap_err();
+        let err = cache.seed_from_normed(0, vec![], vec![], 0, 0).unwrap_err();
         assert!(matches!(err, CacheError::ZeroDim));
     }
 

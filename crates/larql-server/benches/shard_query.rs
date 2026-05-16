@@ -119,5 +119,144 @@ fn bench_vindex_lookup(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_cache_lookup, bench_vindex_lookup);
+/// Cross-layer mutation scenario: mutate layer 1 between every
+/// query at layer 0. With whole-cache invalidation, every mutation
+/// would evict layer 0's cache and the next query rebuilds it.
+/// With per-layer invalidation (2026-05-16), layer 0 stays hot —
+/// the iter measures cache-hit cost + a layer-1 patch insert.
+///
+/// Useful as a regression guard: if per-layer invalidation breaks
+/// and falls back to whole-cache clear, this bench inflates by the
+/// rebuild cost (≈ matvec time at layer 0's n×d shape).
+fn bench_vindex_cross_layer_mutation(c: &mut Criterion) {
+    use larql_models::TopKEntry;
+    use larql_vindex::FeatureMeta;
+
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("shard_query/vindex_cross_layer_mutation");
+    for &(n, d) in &[(64usize, 1024usize), (256, 1024)] {
+        // Build a PatchedVindex with patches at BOTH layer 0 (the
+        // query target) and layer 1 (the mutation target). Layer 1
+        // gets a single patch initially; the bench loop replaces /
+        // re-inserts it on every iter.
+        let base = VectorIndex::new(vec![None, None], vec![None, None], 2, d);
+        let mut patched = PatchedVindex::new(base);
+        let meta = |feat: u32| FeatureMeta {
+            top_token: format!("f{feat}"),
+            top_token_id: feat,
+            c_score: 1.0,
+            top_k: vec![TopKEntry {
+                token: format!("f{feat}"),
+                token_id: feat,
+                logit: 1.0,
+            }],
+        };
+        for i in 0..n {
+            let mut gate = vec![0.0f32; d];
+            gate[i % d] = 1.0;
+            patched.insert_feature(0, i, gate, meta(i as u32));
+        }
+        // Seed one patch at layer 1 so the cross-layer mutation
+        // path is exercised consistently (insert vs. update has the
+        // same invalidation cost on this code path).
+        patched.insert_feature(1, 0, vec![1.0f32; d], meta(1000));
+        let vindex = Arc::new(RwLock::new(patched));
+        let source = ShardSource::vindex(Arc::clone(&vindex), 0.5);
+        let q = query_vec(d);
+
+        // Warm the layer-0 cache once outside the timed loop.
+        rt.block_on(async { source.lookup(0, &q, 1, 0.5).await });
+
+        let id = BenchmarkId::new(format!("n{n}_d{d}_k1"), n * d);
+        group.bench_with_input(id, &q, |b, q| {
+            let mut counter: u32 = 0;
+            b.iter(|| {
+                // Cross-layer mutation: re-insert at layer 1 with a
+                // slightly different gate so it isn't optimised away.
+                counter = counter.wrapping_add(1);
+                let new_gate = vec![counter as f32; d];
+                {
+                    let mut w = vindex.blocking_write();
+                    w.insert_feature(1, 0, new_gate, meta(counter));
+                }
+                // Then query layer 0 — should still hit the cache
+                // because layer 1's invalidation is layer-scoped.
+                rt.block_on(async { black_box(source.lookup(0, black_box(q), 1, 0.5).await) })
+            });
+        });
+    }
+    group.finish();
+}
+
+/// A/B counterpart to [`bench_vindex_cross_layer_mutation`]: simulates
+/// what the old whole-cache invalidation would have cost by forcing
+/// layer 0's cache to rebuild after every cross-layer mutation. Uses
+/// `insert_feature(layer=0, feat=0, …)` to re-insert the same gate
+/// vector at layer 0 — a no-op data change that still invalidates
+/// the cache via the public mutator path. The delta between this
+/// bench and the per-layer one is the savings of per-layer
+/// invalidation in cross-layer workloads.
+fn bench_vindex_cross_layer_mutation_with_full_invalidation(c: &mut Criterion) {
+    use larql_models::TopKEntry;
+    use larql_vindex::FeatureMeta;
+
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("shard_query/vindex_cross_layer_mutation_full_invalidation");
+    for &(n, d) in &[(64usize, 1024usize), (256, 1024)] {
+        let base = VectorIndex::new(vec![None, None], vec![None, None], 2, d);
+        let mut patched = PatchedVindex::new(base);
+        let meta = |feat: u32| FeatureMeta {
+            top_token: format!("f{feat}"),
+            top_token_id: feat,
+            c_score: 1.0,
+            top_k: vec![TopKEntry {
+                token: format!("f{feat}"),
+                token_id: feat,
+                logit: 1.0,
+            }],
+        };
+        for i in 0..n {
+            let mut gate = vec![0.0f32; d];
+            gate[i % d] = 1.0;
+            patched.insert_feature(0, i, gate, meta(i as u32));
+        }
+        patched.insert_feature(1, 0, vec![1.0f32; d], meta(1000));
+        let vindex = Arc::new(RwLock::new(patched));
+        let source = ShardSource::vindex(Arc::clone(&vindex), 0.5);
+        let q = query_vec(d);
+        // Same warmup as the per-layer bench so both start cache-hot.
+        rt.block_on(async { source.lookup(0, &q, 1, 0.5).await });
+        let mut feat0_gate = vec![0.0f32; d];
+        feat0_gate[0] = 1.0;
+
+        let id = BenchmarkId::new(format!("n{n}_d{d}_k1"), n * d);
+        group.bench_with_input(id, &q, |b, q| {
+            let mut counter: u32 = 0;
+            b.iter(|| {
+                counter = counter.wrapping_add(1);
+                let new_gate_l1 = vec![counter as f32; d];
+                {
+                    let mut w = vindex.blocking_write();
+                    // Cross-layer mutation as before…
+                    w.insert_feature(1, 0, new_gate_l1, meta(counter));
+                    // …plus a no-op data update at layer 0 that
+                    // re-invalidates layer 0's cache. This simulates
+                    // what the prior whole-cache `g.clear()` did to
+                    // every layer on every mutation.
+                    w.insert_feature(0, 0, feat0_gate.clone(), meta(0));
+                }
+                rt.block_on(async { black_box(source.lookup(0, black_box(q), 1, 0.5).await) })
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_cache_lookup,
+    bench_vindex_lookup,
+    bench_vindex_cross_layer_mutation,
+    bench_vindex_cross_layer_mutation_with_full_invalidation,
+);
 criterion_main!(benches);
