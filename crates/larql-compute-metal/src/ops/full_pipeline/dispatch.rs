@@ -49,6 +49,14 @@ pub fn encode_rms_norm(
     );
 }
 
+/// Encode `out = a + b_scale * b` via the `residual_add` Metal kernel.
+///
+/// `b_scale = 1.0` is the bit-identical no-op for every non-Granite
+/// model (Llama / Mistral / Gemma / Qwen / Starcoder2 / DeepSeek / Gpt-2 /
+/// Gpt-oss / etc.). Granite-family architectures pass their
+/// `residual_multiplier` (Granite 4.1 3B/8B: 0.22, 30B: 0.175) so the
+/// transformer-block residual stream gets the trained-time scaling HF's
+/// `modeling_granite.py` applies. See [`FullPipelineLayer::residual_multiplier`].
 pub fn encode_residual_add(
     enc: &ComputeCommandEncoderRef,
     add_pipeline: &ComputePipelineState,
@@ -56,6 +64,7 @@ pub fn encode_residual_add(
     buf_b: &Buffer,
     buf_out: &Buffer,
     len: usize,
+    b_scale: f32,
 ) {
     let len_val = len as u32;
     enc.set_compute_pipeline_state(add_pipeline);
@@ -63,6 +72,7 @@ pub fn encode_residual_add(
     enc.set_buffer(1, Some(buf_b), 0);
     enc.set_buffer(2, Some(buf_out), 0);
     enc.set_bytes(3, 4, &len_val as *const u32 as *const c_void);
+    enc.set_bytes(4, 4, &b_scale as *const f32 as *const c_void);
     enc.dispatch_threads(
         MTLSize::new(len as u64, 1, 1),
         MTLSize::new(
@@ -595,6 +605,7 @@ pub fn dispatch_full_pipeline(
                 (hidden * 4) as u64,
                 hidden as u64,
                 (hidden.div_ceil(LEGACY_BLOCK_ELEMS) * 4) as u64,
+                layers[l].residual_multiplier,
             );
             enc.end_encoding();
         }
@@ -695,6 +706,7 @@ pub fn dispatch_full_pipeline(
                 norm_offset,
                 has_post_norms,
                 (hidden * 4) as u64,
+                layers[l].residual_multiplier,
             );
             enc.end_encoding();
         }

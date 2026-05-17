@@ -537,6 +537,10 @@ impl MetalBackend {
                     eps,
                     norm_offset,
                 );
+                // Granite residual_multiplier; 1.0 for every other model.
+                // `residual_norm_store` reads it at buffer(8),
+                // `residual_norm_q8` at buffer(9).
+                let b_scale: f32 = layer.residual_multiplier;
                 if ffn_uses_kquant {
                     enc.set_compute_pipeline_state(&self.norms.residual_norm_store_pipeline);
                     enc.set_buffer(0, Some(bufs.h_buf), 0);
@@ -547,6 +551,7 @@ impl MetalBackend {
                     enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                     enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
                     enc.set_bytes(7, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                    enc.set_bytes(8, 4, &b_scale as *const f32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(
                         MTLSize::new(1, 1, 1),
                         MTLSize::new(
@@ -566,6 +571,7 @@ impl MetalBackend {
                     enc.set_bytes(6, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
                     enc.set_bytes(7, 4, &eps as *const f32 as *const std::ffi::c_void);
                     enc.set_bytes(8, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+                    enc.set_bytes(9, 4, &b_scale as *const f32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(
                         MTLSize::new(1, 1, 1),
                         MTLSize::new(
@@ -577,6 +583,7 @@ impl MetalBackend {
                 }
             }
         } else if ffn_uses_kquant {
+            let b_scale: f32 = layer.residual_multiplier;
             enc.set_compute_pipeline_state(&self.norms.residual_norm_store_pipeline);
             enc.set_buffer(0, Some(bufs.h_buf), 0);
             enc.set_buffer(1, Some(bufs.o_out_buf), 0);
@@ -586,6 +593,7 @@ impl MetalBackend {
             enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
             enc.set_bytes(7, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(8, 4, &b_scale as *const f32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(1, 1, 1),
                 MTLSize::new(
@@ -595,6 +603,7 @@ impl MetalBackend {
                 ),
             );
         } else {
+            let b_scale: f32 = layer.residual_multiplier;
             enc.set_compute_pipeline_state(&self.norms.residual_norm_q8_pipeline);
             enc.set_buffer(0, Some(bufs.h_buf), 0);
             enc.set_buffer(1, Some(bufs.o_out_buf), 0);
@@ -605,6 +614,7 @@ impl MetalBackend {
             enc.set_bytes(6, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(7, 4, &eps as *const f32 as *const std::ffi::c_void);
             enc.set_bytes(8, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(9, 4, &b_scale as *const f32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(1, 1, 1),
                 MTLSize::new(

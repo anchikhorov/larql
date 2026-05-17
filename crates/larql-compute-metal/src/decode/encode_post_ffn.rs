@@ -65,13 +65,26 @@ impl MetalBackend {
         // env var is on, dispatch `residual_norm_store` to fuse the
         // residual-add with the next layer's input rms_norm in one kernel.
         // Saves 1 dispatch per layer × num_layers (~7 µs each).
-        if let Some(fusion) = prelayer_fusion
-            .filter(|_| !norms_view.has_post_norms && self.decode_flags.fused_prelayer_norm)
-        {
+        //
+        // Skip the fusion when Granite's `residual_multiplier != 1.0`:
+        // the `residual_norm_store` kernel hard-codes `out = a + b` and
+        // has no `b_scale` binding, so firing it would silently drop
+        // the residual-stream scaling. The unfused chain below uses
+        // `encode_residual_add(..., layer.residual_multiplier)` which
+        // does apply the scale.
+        if let Some(fusion) = prelayer_fusion.filter(|_| {
+            !norms_view.has_post_norms
+                && self.decode_flags.fused_prelayer_norm
+                && (layer.residual_multiplier - 1.0).abs() < f32::EPSILON
+        }) {
             let next_input_norm_buf = self.bufs.get_f32(fusion.next_input_norm);
             let hidden_val = hidden as u32;
             let eps = norms_view.eps;
             let norm_offset = norms_view.norm_offset;
+            // Granite multiplier is guarded above (this branch only fires
+            // when residual_multiplier == 1.0). Still bind buffer(8) with
+            // 1.0 since the shader now requires the slot.
+            let b_scale: f32 = layer.residual_multiplier;
             enc.set_compute_pipeline_state(&self.norms.residual_norm_store_pipeline);
             enc.set_buffer(0, Some(bufs.h_post_attn), 0); // a (residual base)
             enc.set_buffer(1, Some(bufs.down_out), 0); // b (FFN output)
@@ -81,6 +94,7 @@ impl MetalBackend {
             enc.set_bytes(5, 4, &hidden_val as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
             enc.set_bytes(7, 4, &norm_offset as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(8, 4, &b_scale as *const f32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(
                 MTLSize::new(1, 1, 1),
                 MTLSize::new(
@@ -92,10 +106,17 @@ impl MetalBackend {
             return;
         }
 
+        // Granite never has post_norms, so the post_ffn_norm branch
+        // below is dead for it — but guard the fused `post_ffn_norm_residual_add`
+        // kernel anyway so a future hybrid (post-norm + residual_multiplier)
+        // model doesn't silently regress. The kernel hard-codes
+        // `out = down + h_post_attn` with no `b_scale` binding.
+        let allow_fused_post_norm =
+            use_fused && (layer.residual_multiplier - 1.0).abs() < f32::EPSILON;
         if norms_view.has_post_norms {
             if let Some(post_ffn) = layer.post_ffn_norm {
                 let post_ffn_buf = self.bufs.get_f32(post_ffn);
-                if use_fused {
+                if allow_fused_post_norm {
                     let hidden_val = hidden as u32;
                     let eps = norms_view.eps;
                     let norm_offset = norms_view.norm_offset;
@@ -133,6 +154,7 @@ impl MetalBackend {
                         bufs.normed_scratch,
                         bufs.new_h,
                         hidden,
+                        layer.residual_multiplier,
                     );
                 }
             } else {
@@ -143,6 +165,7 @@ impl MetalBackend {
                     bufs.down_out,
                     bufs.new_h,
                     hidden,
+                    layer.residual_multiplier,
                 );
             }
         } else {
@@ -153,6 +176,7 @@ impl MetalBackend {
                 bufs.down_out,
                 bufs.new_h,
                 hidden,
+                layer.residual_multiplier,
             );
         }
     }
@@ -217,6 +241,7 @@ mod tests {
             moe_combined_output_norm: false,
             moe_outer_post_norm: None,
             kv_shared_source: None,
+            residual_multiplier: 1.0,
             ple_input_gate: None,
             ple_projection: None,
             ple_post_norm: None,

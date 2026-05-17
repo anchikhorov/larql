@@ -258,6 +258,7 @@ fn stage_post_attn_pre_norm_matches_cpu() {
         (hidden * 4) as u64,
         hidden as u64,
         (hidden.div_ceil(32) * 4) as u64,
+        1.0,
     );
     enc.end_encoding();
     cmd.commit();
@@ -353,6 +354,7 @@ fn stage_post_attn_post_norm_matches_cpu() {
         (hidden * 4) as u64,
         hidden as u64,
         (hidden.div_ceil(32) * 4) as u64,
+        1.0,
     );
     enc.end_encoding();
     cmd.commit();
@@ -413,6 +415,7 @@ fn stage_post_ffn_pre_norm_matches_cpu() {
         0.0,
         /*has_post_norms*/ false,
         (hidden * 4) as u64,
+        1.0,
     );
     enc.end_encoding();
     cmd.commit();
@@ -478,6 +481,7 @@ fn stage_post_ffn_post_norm_matches_cpu() {
         offset,
         /*has_post_norms*/ true,
         (hidden * 4) as u64,
+        1.0,
     );
     enc.end_encoding();
     cmd.commit();
@@ -1025,6 +1029,7 @@ fn stage_post_attn_q8_ffn_emits_roundtrippable_q8() {
         (hidden * 4) as u64,
         hidden as u64,
         (hidden.div_ceil(32) * 4) as u64,
+        1.0,
     );
     enc.end_encoding();
     cmd.commit();

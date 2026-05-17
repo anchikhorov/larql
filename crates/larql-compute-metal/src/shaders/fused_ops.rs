@@ -93,6 +93,12 @@ kernel void residual_norm(
 }
 
 // Fused residual add + RMS norm + Q8 quantize — single threadgroup.
+//
+// `b_scale` at buffer(9) is the Granite-family residual_multiplier:
+// 0.22 on 3B/8B, 0.175 on 30B, and 1.0 (no-op) for every non-Granite
+// arch. The `a[i] + b_scale * b[i]` form mirrors the unfused
+// `residual_add` shader in `residual_inject.rs` so behaviour is
+// consistent across fused / unfused decode paths.
 kernel void residual_norm_q8(
     device const float* a      [[buffer(0)]],
     device const float* b      [[buffer(1)]],
@@ -103,6 +109,7 @@ kernel void residual_norm_q8(
     constant uint&      len    [[buffer(6)]],
     constant float&     eps    [[buffer(7)]],
     constant float&     offset [[buffer(8)]],
+    constant float&     b_scale[[buffer(9)]],
     uint tid   [[thread_index_in_threadgroup]],
     uint tg_sz [[threads_per_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]],
@@ -110,7 +117,7 @@ kernel void residual_norm_q8(
 {
     // Write f32 sum first (all elements)
     for (uint i = tid; i < len; i += tg_sz) {
-        f32_out[i] = a[i] + b[i];
+        f32_out[i] = a[i] + b_scale * b[i];
     }
 
     // Cooperative sum_sq
@@ -149,6 +156,11 @@ kernel void residual_norm_q8(
 // Replaces the residual_norm + residual_add two-dispatch pair (Q4_K hot path).
 // Single dispatch writes both ffn_norm_out (normed, for FFN input) and
 // h_post_attn (raw sum, for post-FFN residual add). Saves 34 dispatches/token.
+//
+// `b_scale` at buffer(8) is the Granite-family residual_multiplier; 1.0
+// (no-op) for every other arch. The sum becomes `a[i] + b_scale * b[i]`
+// in both the squared-sum pass and the write pass, matching HF
+// `modeling_granite.py`'s `residual + residual_multiplier * o`.
 kernel void residual_norm_store(
     device const float* a         [[buffer(0)]],  // h (pre-attn residual)
     device const float* b         [[buffer(1)]],  // o (attn output)
@@ -158,6 +170,7 @@ kernel void residual_norm_store(
     constant uint&      len       [[buffer(5)]],
     constant float&     eps       [[buffer(6)]],
     constant float&     offset    [[buffer(7)]],
+    constant float&     b_scale   [[buffer(8)]],
     uint tid   [[thread_index_in_threadgroup]],
     uint tg_sz [[threads_per_threadgroup]],
     uint lane  [[thread_index_in_simdgroup]],
@@ -165,7 +178,7 @@ kernel void residual_norm_store(
 {
     float partial = 0.0f;
     for (uint i = tid; i < len; i += tg_sz) {
-        float hi = a[i] + b[i];
+        float hi = a[i] + b_scale * b[i];
         partial += hi * hi;
     }
     float sg_sum = simd_sum(partial);
@@ -178,7 +191,7 @@ kernel void residual_norm_store(
     float rms = 1.0f / sqrt(sum_sq / float(len) + eps);
 
     for (uint i = tid; i < len; i += tg_sz) {
-        float h = a[i] + b[i];
+        float h = a[i] + b_scale * b[i];
         sum_out[i]  = h;
         norm_out[i] = h * (weight[i] + offset) * rms;
     }

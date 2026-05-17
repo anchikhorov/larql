@@ -18,16 +18,24 @@ kernel void residual_copy(
     dst[tid] = src[tid];
 }
 
-// Residual add: out = a + b (skip connection).
+// Residual add: out = a + b_scale * b (skip connection).
+//
+// `b_scale` defaults to 1.0 for every model except Granite-family
+// architectures, which set `residual_multiplier` (0.22 on Granite 4.1
+// 3B/8B, 0.175 on Granite 4.1 30B μP). The Rust wrapper
+// `encode_residual_add` always binds buffer(4); callers that don't
+// need scaling pass 1.0 and the multiplication is a no-op (the f32
+// hardware multiply is single-cycle).
 kernel void residual_add(
-    device const float* a   [[buffer(0)]],
-    device const float* b   [[buffer(1)]],
-    device float*       out [[buffer(2)]],
-    constant uint&      len [[buffer(3)]],
+    device const float* a       [[buffer(0)]],
+    device const float* b       [[buffer(1)]],
+    device float*       out     [[buffer(2)]],
+    constant uint&      len     [[buffer(3)]],
+    constant float&     b_scale [[buffer(4)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid >= len) return;
-    out[tid] = a[tid] + b[tid];
+    out[tid] = a[tid] + b_scale * b[tid];
 }
 
 // Scale vector: out = input * scalar (per-layer scalar multiplier, Gemma 4).

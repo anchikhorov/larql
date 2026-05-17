@@ -273,6 +273,10 @@ fn residual_add_matches_cpu() {
     let buf_out = bufs.output((len * 4) as u64);
     let len_val = len as u32;
 
+    // residual_add now takes a `b_scale` at buffer(4) so Granite-family
+    // models can pass `residual_multiplier` through the kernel. Bind 1.0
+    // to recover the original `out = a + b` semantics for this test.
+    let b_scale: f32 = 1.0;
     let cmd = queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
@@ -280,6 +284,7 @@ fn residual_add_matches_cpu() {
     enc.set_buffer(1, Some(&buf_b), 0);
     enc.set_buffer(2, Some(&buf_out), 0);
     enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &b_scale as *const f32 as *const std::ffi::c_void);
     enc.dispatch_threads(
         metal::MTLSize::new(len as u64, 1, 1),
         metal::MTLSize::new(len as u64, 1, 1),
@@ -293,6 +298,62 @@ fn residual_add_matches_cpu() {
 
     let diff = max_diff(&cpu_result, &metal_result);
     assert!(diff < 1e-6, "residual_add max diff {diff}");
+}
+
+/// Granite-family `residual_multiplier`: the same kernel with
+/// `b_scale != 1.0` must compute `out = a + b_scale * b`. This was the
+/// missing piece that caused Granite 4.1's transformer residual stream
+/// to overflow (3B residual_multiplier = 0.22; running it as 1.0
+/// produced "ikea ikea ikea…" degenerate output).
+#[test]
+fn residual_add_applies_b_scale() {
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute_metal::shaders::all_shaders();
+    let lib = device
+        .new_library_with_source(&src, &metal::CompileOptions::new())
+        .unwrap();
+    let pipeline = device
+        .new_compute_pipeline_state_with_function(&lib.get_function("residual_add", None).unwrap())
+        .unwrap();
+    let bufs = larql_compute_metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let len = 128usize;
+    let a: Vec<f32> = (0..len).map(|i| i as f32 * 0.1).collect();
+    let b: Vec<f32> = (0..len).map(|i| -(i as f32 * 0.05)).collect();
+    // Granite 4.1 3B / 8B residual_multiplier value.
+    let b_scale: f32 = 0.22;
+    let cpu_result: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| x + b_scale * y)
+        .collect();
+
+    let buf_a = bufs.transient_from_f32(&a);
+    let buf_b = bufs.transient_from_f32(&b);
+    let buf_out = bufs.output((len * 4) as u64);
+    let len_val = len as u32;
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&pipeline);
+    enc.set_buffer(0, Some(&buf_a), 0);
+    enc.set_buffer(1, Some(&buf_b), 0);
+    enc.set_buffer(2, Some(&buf_out), 0);
+    enc.set_bytes(3, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &b_scale as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_threads(
+        metal::MTLSize::new(len as u64, 1, 1),
+        metal::MTLSize::new(len as u64, 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let ptr = buf_out.contents() as *const f32;
+    let metal_result: Vec<f32> = unsafe { std::slice::from_raw_parts(ptr, len).to_vec() };
+    let diff = max_diff(&cpu_result, &metal_result);
+    assert!(diff < 1e-6, "residual_add b_scale=0.22 max diff {diff}");
 }
 
 // ── quantize_q8 shader ──
@@ -556,6 +617,10 @@ fn residual_norm_store_matches_separate_ops() {
     let buf_norm = bufs.output((len * 4) as u64);
     let buf_sum = bufs.output((len * 4) as u64);
     let len_val = len as u32;
+    // `residual_norm_store` now takes `b_scale` at buffer(8) (Granite
+    // residual_multiplier). 1.0 recovers the original `a + b` semantics
+    // for non-Granite parity tests.
+    let b_scale: f32 = 1.0;
 
     let cmd = queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
@@ -568,6 +633,7 @@ fn residual_norm_store_matches_separate_ops() {
     enc.set_bytes(5, 4, &len_val as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
     enc.set_bytes(7, 4, &offset as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &b_scale as *const f32 as *const std::ffi::c_void);
     enc.dispatch_thread_groups(
         metal::MTLSize::new(1, 1, 1),
         metal::MTLSize::new(256.min(len as u64), 1, 1),
@@ -590,6 +656,93 @@ fn residual_norm_store_matches_separate_ops() {
     assert!(
         diff_sum < 1e-6,
         "residual_norm_store sum_out max diff {diff_sum} (must be exact)"
+    );
+}
+
+/// Granite residual_multiplier coverage on the fused
+/// `residual_norm_store` kernel: with `b_scale = 0.22` the kernel must
+/// compute `sum = a + 0.22 * b` and `norm = rms_norm(sum)`. This is the
+/// kernel that fires on the post-attention residual during single-token
+/// decode (`encode_attn.rs` ffn_uses_kquant branch) and on the optional
+/// D-RMS-FUSE Phase 1 fusion at the post-FFN→next-input boundary.
+#[test]
+fn residual_norm_store_applies_b_scale() {
+    let device = metal::Device::system_default().unwrap();
+    let src = larql_compute_metal::shaders::all_shaders();
+    let lib = device
+        .new_library_with_source(&src, &metal::CompileOptions::new())
+        .unwrap();
+    let fused = device
+        .new_compute_pipeline_state_with_function(
+            &lib.get_function("residual_norm_store", None).unwrap(),
+        )
+        .unwrap();
+    let bufs = larql_compute_metal::buffers::BufferCache::new(&device);
+    let queue = device.new_command_queue();
+
+    let len = 64usize;
+    let a: Vec<f32> = (0..len).map(|i| i as f32 * 0.07 - 1.5).collect();
+    let b: Vec<f32> = (0..len).map(|i| i as f32 * 0.04 + 0.2).collect();
+    let weight: Vec<f32> = (0..len).map(|i| 0.6 + i as f32 * 0.003).collect();
+    let eps = 1e-6f32;
+    let offset = 0.0f32;
+    // Granite 4.1 3B/8B value.
+    let b_scale: f32 = 0.22;
+
+    let cpu_sum: Vec<f32> = a
+        .iter()
+        .zip(b.iter())
+        .map(|(x, y)| x + b_scale * y)
+        .collect();
+    let sum_sq: f32 = cpu_sum.iter().map(|v| v * v).sum();
+    let rms = 1.0 / (sum_sq / len as f32 + eps).sqrt();
+    let cpu_norm: Vec<f32> = cpu_sum
+        .iter()
+        .zip(weight.iter())
+        .map(|(s, w)| s * (w + offset) * rms)
+        .collect();
+
+    let buf_a = bufs.transient_from_f32(&a);
+    let buf_b = bufs.transient_from_f32(&b);
+    let buf_w = bufs.transient_from_f32(&weight);
+    let buf_norm = bufs.output((len * 4) as u64);
+    let buf_sum = bufs.output((len * 4) as u64);
+    let len_val = len as u32;
+
+    let cmd = queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&fused);
+    enc.set_buffer(0, Some(&buf_a), 0);
+    enc.set_buffer(1, Some(&buf_b), 0);
+    enc.set_buffer(2, Some(&buf_w), 0);
+    enc.set_buffer(3, Some(&buf_norm), 0);
+    enc.set_buffer(4, Some(&buf_sum), 0);
+    enc.set_bytes(5, 4, &len_val as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(7, 4, &offset as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &b_scale as *const f32 as *const std::ffi::c_void);
+    enc.dispatch_thread_groups(
+        metal::MTLSize::new(1, 1, 1),
+        metal::MTLSize::new(256.min(len as u64), 1, 1),
+    );
+    enc.end_encoding();
+    cmd.commit();
+    cmd.wait_until_completed();
+
+    let norm_ptr = buf_norm.contents() as *const f32;
+    let sum_ptr = buf_sum.contents() as *const f32;
+    let metal_norm: Vec<f32> = unsafe { std::slice::from_raw_parts(norm_ptr, len).to_vec() };
+    let metal_sum: Vec<f32> = unsafe { std::slice::from_raw_parts(sum_ptr, len).to_vec() };
+
+    let diff_sum = max_diff(&cpu_sum, &metal_sum);
+    assert!(
+        diff_sum < 1e-6,
+        "residual_norm_store b_scale=0.22 sum_out diff {diff_sum} (must be exact)"
+    );
+    let diff_norm = max_diff(&cpu_norm, &metal_norm);
+    assert!(
+        diff_norm < 1e-4,
+        "residual_norm_store b_scale=0.22 norm_out diff {diff_norm}"
     );
 }
 
@@ -633,6 +786,9 @@ fn residual_norm_store_with_norm_offset() {
     let buf_norm = bufs.output((len * 4) as u64);
     let buf_sum = bufs.output((len * 4) as u64);
     let len_val = len as u32;
+    // `residual_norm_store` now requires `b_scale` at buffer(8). 1.0 is
+    // the no-op for non-Granite parity tests.
+    let b_scale: f32 = 1.0;
 
     let cmd = queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
@@ -645,6 +801,7 @@ fn residual_norm_store_with_norm_offset() {
     enc.set_bytes(5, 4, &len_val as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
     enc.set_bytes(7, 4, &offset as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &b_scale as *const f32 as *const std::ffi::c_void);
     enc.dispatch_thread_groups(
         metal::MTLSize::new(1, 1, 1),
         metal::MTLSize::new(256.min(len as u64), 1, 1),

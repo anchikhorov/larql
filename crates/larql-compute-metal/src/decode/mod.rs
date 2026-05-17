@@ -450,7 +450,13 @@ impl MetalBackend {
                 if stage_timing_split && !has_moe {
                     // Fine split: gate+up in one CB, act+down+residual in another.
                     // Step 6a: gate+up
-                    self.encode_ffn_gate_up_phase(&enc, layer, &ffn_bufs, ffn_dims, ffn_uses_kquant);
+                    self.encode_ffn_gate_up_phase(
+                        &enc,
+                        layer,
+                        &ffn_bufs,
+                        ffn_dims,
+                        ffn_uses_kquant,
+                    );
                     enc.end_encoding();
                     cmd.commit();
                     cmd.wait_until_completed();

@@ -732,6 +732,10 @@ fn residual_add_correct() {
     let buf_out = bufs.output(16);
     let len = 4u32;
 
+    // `residual_add` shader now requires `b_scale` at buffer(4) for
+    // Granite-family residual_multiplier. 1.0 recovers the legacy
+    // `a + b` semantics this test was written against.
+    let b_scale: f32 = 1.0;
     let cmd = queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&pipeline);
@@ -739,6 +743,7 @@ fn residual_add_correct() {
     enc.set_buffer(1, Some(&buf_b), 0);
     enc.set_buffer(2, Some(&buf_out), 0);
     enc.set_bytes(3, 4, &len as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &b_scale as *const f32 as *const std::ffi::c_void);
     enc.dispatch_threads(metal::MTLSize::new(4, 1, 1), metal::MTLSize::new(4, 1, 1));
     enc.end_encoding();
     cmd.commit();
@@ -1431,6 +1436,7 @@ fn full_pipeline_seq1_produces_nonzero() {
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
         kv_shared_source: None,
+            residual_multiplier: 1.0,
         ple_input_gate: None,
         ple_projection: None,
         ple_post_norm: None,

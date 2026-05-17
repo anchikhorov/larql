@@ -143,6 +143,7 @@ fn build_synth_layer<'a>(
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
         kv_shared_source: None,
+            residual_multiplier: 1.0,
         ple_input_gate: None,
         ple_projection: None,
         ple_post_norm: None,
@@ -432,6 +433,7 @@ fn decode_token_gemma3_style_post_norms_smoke() {
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
         kv_shared_source: None,
+            residual_multiplier: 1.0,
         ple_input_gate: None,
         ple_projection: None,
         ple_post_norm: None,
@@ -641,6 +643,7 @@ fn decode_token_qkv_fused_opt_in_smoke() {
         moe_combined_output_norm: false,
         moe_outer_post_norm: None,
         kv_shared_source: None,
+            residual_multiplier: 1.0,
         ple_input_gate: None,
         ple_projection: None,
         ple_post_norm: None,
@@ -748,7 +751,11 @@ fn prefill_q4_seq4_synthetic_smoke() {
     };
 
     // prefill_kquant returns seq_len × hidden (all positions, not just last).
-    assert_eq!(result.len(), seq_len * HIDDEN, "prefill_kquant output length");
+    assert_eq!(
+        result.len(),
+        seq_len * HIDDEN,
+        "prefill_kquant output length"
+    );
     assert_eq!(result.iter().filter(|v| v.is_nan()).count(), 0);
     assert_eq!(result.iter().filter(|v| v.is_infinite()).count(), 0);
     let max_abs = result.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
@@ -1427,7 +1434,18 @@ fn prefill_q4_with_gelu_tanh_activation_drives_gelu_tanh_pipeline() {
     layer2.activation = larql_compute::Activation::GeluTanh;
     let delta = vec![0.0f32; HIDDEN];
     let out2 = metal
-        .prefill_kquant_with_head_replacement(&[layer2], &x, HIDDEN, INTER, 1, false, 0.0, 0, 0, &delta)
+        .prefill_kquant_with_head_replacement(
+            &[layer2],
+            &x,
+            HIDDEN,
+            INTER,
+            1,
+            false,
+            0.0,
+            0,
+            0,
+            &delta,
+        )
         .expect("head-replacement returns Some");
     assert_eq!(out2.len(), HIDDEN);
 }
@@ -1488,8 +1506,8 @@ fn decode_backend_full_pipeline_q4_capture_pre_wo_runs() {
     )];
     let x = synth_input(HIDDEN, 0.9);
     let backend: &dyn DecodeBackend = &metal;
-    let out =
-        backend.full_pipeline_kquant_capture_pre_wo(&layers, &x, HIDDEN, INTER, 1, false, 0.0, 0, 0);
+    let out = backend
+        .full_pipeline_kquant_capture_pre_wo(&layers, &x, HIDDEN, INTER, 1, false, 0.0, 0, 0);
     let capture = out.expect("capture_pre_wo returns Some");
     // capture is a Vec<f32> of seq_len × head_dim; pin shape.
     assert_eq!(capture.len(), HEAD_DIM);

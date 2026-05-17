@@ -153,6 +153,7 @@ mod tests {
             moe_combined_output_norm,
             moe_outer_post_norm,
             kv_shared_source: None,
+            residual_multiplier: 1.0,
             ple_input_gate: None,
             ple_projection: None,
             ple_post_norm: None,

@@ -54,6 +54,11 @@ pub fn encode_post_attn(
     h_stride_bytes: u64,
     q8_stride_bytes: u64,
     q8s_stride_bytes: u64,
+    // Granite-style residual_multiplier (0.22 on 3B/8B, 0.175 on 30B);
+    // 1.0 for every non-Granite model and bit-identical no-op there.
+    // Bound at buffer(4) of the `residual_add` shader. See
+    // `FullPipelineLayer::residual_multiplier`.
+    b_scale: f32,
 ) {
     let hidden_val = hidden as u32;
     let tg_threads = crate::kernels::DISPATCH_TG_MAX_THREADS.min(hidden as u64);
@@ -80,6 +85,7 @@ pub fn encode_post_attn(
             enc.set_buffer(1, Some(&normed), 0);
             enc.set_buffer(2, Some(h_post_attn), h_off);
             enc.set_bytes(3, 4, &hidden_val as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &b_scale as *const f32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(hidden as u64, 1, 1),
                 MTLSize::new(tg_threads, 1, 1),
@@ -91,6 +97,7 @@ pub fn encode_post_attn(
             enc.set_buffer(1, Some(o_out), h_off);
             enc.set_buffer(2, Some(h_post_attn), h_off);
             enc.set_bytes(3, 4, &hidden_val as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &b_scale as *const f32 as *const c_void);
             enc.dispatch_threads(
                 MTLSize::new(hidden as u64, 1, 1),
                 MTLSize::new(tg_threads, 1, 1),
@@ -146,6 +153,9 @@ pub fn encode_post_ffn(
     norm_offset: f32,
     has_post_norms: bool,
     h_stride_bytes: u64,
+    // Granite-style residual_multiplier; 1.0 for non-Granite. See
+    // `encode_post_attn` doc for context.
+    b_scale: f32,
 ) {
     let hidden_val = hidden as u32;
     let tg_threads = crate::kernels::DISPATCH_TG_MAX_THREADS.min(hidden as u64);
@@ -170,6 +180,7 @@ pub fn encode_post_ffn(
                 enc.set_buffer(1, Some(&normed), 0);
                 enc.set_buffer(2, Some(h_next), h_off);
                 enc.set_bytes(3, 4, &hidden_val as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &b_scale as *const f32 as *const c_void);
                 enc.dispatch_threads(
                     MTLSize::new(hidden as u64, 1, 1),
                     MTLSize::new(tg_threads, 1, 1),
@@ -184,6 +195,7 @@ pub fn encode_post_ffn(
         enc.set_buffer(1, Some(down_out), h_off);
         enc.set_buffer(2, Some(h_next), h_off);
         enc.set_bytes(3, 4, &hidden_val as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &b_scale as *const f32 as *const c_void);
         enc.dispatch_threads(
             MTLSize::new(hidden as u64, 1, 1),
             MTLSize::new(tg_threads, 1, 1),

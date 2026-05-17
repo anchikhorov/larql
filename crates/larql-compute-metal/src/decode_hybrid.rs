@@ -336,6 +336,7 @@ impl MetalBackend {
                     &normed_o,
                     &h_post_attn,
                     hidden,
+                    layer.residual_multiplier,
                 );
             } else {
                 // Standard: add O directly
@@ -347,6 +348,7 @@ impl MetalBackend {
                     &o_out,
                     &h_post_attn,
                     hidden,
+                    layer.residual_multiplier,
                 );
             }
         } else {
@@ -410,6 +412,7 @@ impl MetalBackend {
                     &normed_o,
                     &h_post_attn,
                     hidden,
+                    layer.residual_multiplier,
                 );
             } else {
                 use crate::ops::full_pipeline::encode_residual_add;
@@ -420,6 +423,7 @@ impl MetalBackend {
                     &o_out,
                     &h_post_attn,
                     hidden,
+                    layer.residual_multiplier,
                 );
             }
         }

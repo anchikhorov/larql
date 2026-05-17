@@ -53,6 +53,9 @@ fn residual_norm_store_matches_residual_norm_and_raw_sum() {
     let buf_sum = metal.bufs().output((len * 4) as u64);
     let len_val = len as u32;
 
+    // `residual_norm_store` takes Granite `b_scale` at buffer(8); 1.0
+    // recovers the original behaviour these parity tests check.
+    let b_scale: f32 = 1.0;
     let cmd = metal.queue().new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&metal.norms.residual_norm_store_pipeline);
@@ -64,6 +67,7 @@ fn residual_norm_store_matches_residual_norm_and_raw_sum() {
     enc.set_bytes(5, 4, &len_val as *const u32 as *const std::ffi::c_void);
     enc.set_bytes(6, 4, &eps as *const f32 as *const std::ffi::c_void);
     enc.set_bytes(7, 4, &offset as *const f32 as *const std::ffi::c_void);
+    enc.set_bytes(8, 4, &b_scale as *const f32 as *const std::ffi::c_void);
     enc.dispatch_thread_groups(
         metal::MTLSize::new(1, 1, 1),
         metal::MTLSize::new(256_u64.min(len as u64), 1, 1),
