@@ -18,7 +18,8 @@ use larql_inference::forward::{
     logit_lens_topk, patch_and_trace_with_ffn,
     project_through_unembed as li_project_through_unembed, trace_forward_full_hooked,
     track_race as li_track_race, track_token as li_track_token,
-    unembedding_row as li_unembedding_row, RecordHook, SteerHook, ZeroAblateHook,
+    unembedding_row as li_unembedding_row, AttnZeroHook, FFNZeroHook, RecordHook, SteerHook,
+    ZeroAblateHook,
 };
 use larql_inference::{predict_with_ffn, ModelWeights, WalkFfn};
 use larql_kv::generation::generate_cached_hooked;
@@ -621,6 +622,92 @@ impl PyWalkModel {
 
         let out = PyDict::new(py);
         for (layer, mat) in hook.post_layer.iter() {
+            out.set_item(*layer, mat.clone().into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    /// Run a forward pass with the **FFN sublayer skipped at every layer**
+    /// (the FFN computation still runs but its addition to the residual stream
+    /// is discarded) and capture the resulting post-layer residual at each
+    /// requested layer. Used for attention-vs-FFN decomposition: this gives
+    /// the "attention-only contribution" residual stream.
+    ///
+    /// Returns `dict[layer_index] -> numpy.ndarray (seq_len, hidden_size)`.
+    #[pyo3(signature = (prompt, layers))]
+    fn forward_attn_only<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let token_ids = self.encode(prompt)?;
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+        let n_layers = self.weights.num_layers;
+        let mut ffn_zero = FFNZeroHook::for_layers(0..n_layers);
+        let mut record = RecordHook::for_layers(layers.iter().copied());
+        {
+            let mut composite = larql_inference::forward::CompositeHook::new(vec![
+                &mut ffn_zero as &mut dyn larql_inference::forward::LayerHook,
+                &mut record as &mut dyn larql_inference::forward::LayerHook,
+            ]);
+            let _ = trace_forward_full_hooked(
+                &self.weights,
+                &token_ids,
+                &layers,
+                false,
+                0,
+                false,
+                &walk_ffn,
+                &mut composite,
+            );
+        }
+
+        let out = PyDict::new(py);
+        for (layer, mat) in record.post_layer.iter() {
+            out.set_item(*layer, mat.clone().into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    /// Run a forward pass with the **attention sublayer skipped at every
+    /// layer** (the attention computation still runs but its addition to the
+    /// residual stream is discarded) and capture the resulting post-layer
+    /// residual at each requested layer. Used for attention-vs-FFN
+    /// decomposition: this gives the "FFN-only contribution" residual stream.
+    ///
+    /// Returns `dict[layer_index] -> numpy.ndarray (seq_len, hidden_size)`.
+    #[pyo3(signature = (prompt, layers))]
+    fn forward_ffn_only<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let token_ids = self.encode(prompt)?;
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+        let n_layers = self.weights.num_layers;
+        let mut attn_zero = AttnZeroHook::for_layers(0..n_layers);
+        let mut record = RecordHook::for_layers(layers.iter().copied());
+        {
+            let mut composite = larql_inference::forward::CompositeHook::new(vec![
+                &mut attn_zero as &mut dyn larql_inference::forward::LayerHook,
+                &mut record as &mut dyn larql_inference::forward::LayerHook,
+            ]);
+            let _ = trace_forward_full_hooked(
+                &self.weights,
+                &token_ids,
+                &layers,
+                false,
+                0,
+                false,
+                &walk_ffn,
+                &mut composite,
+            );
+        }
+
+        let out = PyDict::new(py);
+        for (layer, mat) in record.post_layer.iter() {
             out.set_item(*layer, mat.clone().into_pyarray(py))?;
         }
         Ok(out)
