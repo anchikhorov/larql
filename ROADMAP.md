@@ -186,7 +186,7 @@ Current state (2026-05-15):
 | **GPU (Metal)** | Gemma 3 4B prefill (340 tok) | per-pos matvec | gemm | 14× behind | far over |
 | **GPU (Metal)** | Gemma 4 + MTP (when adopted) | 88 tok/s no-MTP | ~225 with MTP | ~2.6× behind | far over |
 | **CPU** | Gemma 3 4B Q4K decode | 24.5 tok/s | llama.cpp Q4_K_M CPU 42.53 tok/s | ~1.69× behind | over (KV-cache + direct Q4_K matvec + NEON Q4_K/Q6_K/f32_dot + Q4 lm_head + 4-way acc + par_chunks_mut(32) + Q4_K×Q8_K sdot + auto-t=8 on Apple silicon landed 2026-05-15/16; ~68× over original 0.36 tok/s baseline. Per-core ratio 1.73× (kernel inner-loop vs llama.cpp's hand-asm); remaining gap needs prefetch + scheduling. See `bench/baselines/cpu/DIAGNOSIS.md`) |
-| **CPU** | Gemma 4 26B-A4B decode | currently grid 18.3 tok/s | unknown | unknown | not measurable yet |
+| **CPU** | Gemma 4 26B-A4B decode | in-proc KV-cached MoE **~1.8 tok/s** (n=8 smoke 2026-06-06, UNVERIFIED; historical grid 18.3 / shard-KV 4.4 unreconciled) | pending — Q4_K_M GGUF built from *cached* safetensors (no download), `/tmp/gemma4-26b-Q4_K_M.gguf` | TBD | **STAGED, blocked on idle machine** (under load a known-good 4B clocked 0.5 vs ~43 warm = contention). In-process row wired via `LocalMoeFfn`; runbook `bench/baselines/c10_gemma4-26b-a4b_cpu_RUNBOOK.md`. gemma4-in-llama.cpp CPU speed also unverified (1-core run seen under load). |
 
 Items the threshold makes load-bearing (not optional) on the **GPU track**:
 - **D-ATTN-MTG** — flash attention; without it, attention-mechanism deltas are muddied by missing baseline.
@@ -301,6 +301,30 @@ to a co-equal functionality track with its own exit criteria:
 **Exit criterion:** the README's `INSERT` / `DESCRIBE` / `walk` / compile demo is
 backed end-to-end by tested LQL verbs (not example scripts), with edits
 verifiable via TRACE parity and reversible.
+
+### FR — Fleet routing extensions (added 2026-06-07)
+
+Four routing/edit explorations seeded by the `chris-experiments/fleet`
+native-store arc (E10–E17) and the `videos/the-mechanism` build story — the
+fleet and LARQL's KNN/COMPOSE converged on the same architecture
+(`fleet/SYNTHESIS.md` §9). **Measurement-experiment-first:** each item runs its
+falsification probe on a real LARQL vindex, in predictive units (recall@k / NLL /
+KL / drift / confident-wrong — mean-P/mean-cosine banned), **before** any build;
+builds land parity-first (default off = byte-identical). Full spec + frozen
+pre-registrations: [`docs/fleet-routing-extensions.md`](docs/fleet-routing-extensions.md).
+
+The mechanism: factual memory is addressed by **(relation, entity) → value**; the
+relation is a *clean* semantic index, the entity is *top-k fuzzy*; the model
+*addresses*, it does not *unpack*; and operations split at linear-aggregate (rides
+free) vs joint-nonlinear (walls). FR1 ⊂ FR2 (top-k is the fuzzy tier of the
+two-tier router). FR3 is the cleanest standalone win; FR4 is research-first.
+
+| # | Item | Crate | Status |
+|---|------|-------|--------|
+| FR1 | **Top-k fuzzy entity router + verifier.** Inference routes on top-1 cosine + a fixed 0.75 gate (`infer_patched.rs:162-163`), the brittle near-rank-1 path E11/E15 indict; `query_knn` top-k exists (`knn_store.rs:132`) but is unused. **MEASURED ✅ (2026-06-07, Gemma-3-4B N=150):** entity key real & answer-leak-free at L24-26 (L26 top1 0.89/top5 0.95, cross-rel 1.00 — beats E15's MLP under cosine-NN, no training); the live 0.75 gate fires **150/150** with **11% confident-wrong @L26 / 84% @L20**. **BUILT ✅ (2026-06-07):** `apply_knn_override_verified` — top-k + entity-in-prompt verify + abstain, resolved-layer-first (no hardcoded layer), opt-in `LARQL_KNN_VERIFY`, default off = byte-identical (14 legacy tests green). E2E on real Gemma-3-4B: legacy "Germany's capital city is"→SpainX (confident-wrong) → verified→GermanyX (fixed), Poland correct both (no regression). 5 unit tests, clippy clean. **LQL surface landed:** first-class `INFER … ROUTE VERIFY [FALLBACK] [TOPK n]` clause (`KnnRouteMode` threaded through `infer_patched`, default Legacy = byte-identical; env vars set the default when no clause). E2E no-env: `ROUTE VERIFY` → Germany fixed. [`docs/diagnoses/fr1-topk-fuzzy-router.md`](docs/diagnoses/fr1-topk-fuzzy-router.md) §"BUILD LANDED". | larql-vindex, larql-inference, larql-lql | **built ✅ (LQL clause + env)** |
+| FR2 | **Two-tier router: symbolic-primary → activation-fuzzy fallback** (E16 assembled). `entries_for_entity` exact lookup exists (`knn_store.rs:172`) but isn't sequenced into routing. **MEASURED ✅ (2026-06-07, Gemma-3-4B):** symbolic exact-match **0/10** aliases, activation fallback **10/10 top-1** @L24/L26 (Persia→Iran, …) — E16 reproduced. Caveat: famous-alias easy end (general = FR1's ~0.9 top-5); FR1 verifier bounds confident-wrong. **BUILT ✅ (2026-06-07):** `apply_knn_override_two_tier` (tier-1 FR1 verify → tier-2 activation alias fallback, opt-in `LARQL_KNN_VERIFY`+`LARQL_KNN_FALLBACK`, default off = byte-identical). E2E real Gemma-3-4B: "capital of Persia" → verify-only abstains (Tehran), two-tier recovers IranX (cos 0.97), no regression on named. 4 unit tests, clippy clean. Tier-2 is the fuzzy ~0.7-0.9 route (fires only when verify missed). **LQL:** `INFER … ROUTE VERIFY FALLBACK` (E2E no-env: Persia→IranX). [`docs/diagnoses/fr2-two-tier-router.md`](docs/diagnoses/fr2-two-tier-router.md). | larql-inference, larql-vindex, larql-lql | **built ✅ (LQL clause + env)** |
+| FR3 | **Relation as a clean semantic address.** Relation probe generalizes to unseen synonyms at ~1.000 (`the-mechanism/address.py`); `RelationClassifier` (`relations.rs`) is the foundation. **MEASURED ✅ (2026-06-07, Gemma-3-4B N=40):** synonym-gen **1.00 at every layer L6-L26** (train {capital,currency,language} → classify unseen {seat,money,tongue,…}, semantic not lexical; clean from **L6**, earlier than the video's L10); asymmetry stark — relation 1.00 early vs entity top-1 0.07-0.20 until L26. **BUILT ✅ (2026-06-07):** `RelationResolver` — trained residual softmax probe (not string/cosine; the near-rank-1 "proxy" trap avoided), model-agnostic probe layer (`round(0.3·num_layers)`), wired into `SELECT … FROM EDGES WHERE relation=…` as a semantic fallback (cached per vindex). E2E real Gemma-3-4B: `WHERE relation="seat"` → resolved to "capital". 2 unit tests, 717 lql green, clippy clean. [`docs/diagnoses/fr3-relation-address.md`](docs/diagnoses/fr3-relation-address.md) §"BUILD LANDED". | larql-lql, larql-vindex | **built ✅ (SELECT)** |
+| FR4 | **Operation-class dispatch boundary** (E17 compute ladder). Linear-aggregate ops (COUNT/THRESHOLD/MAJORITY) ride the read free; joint-bit (PARITY) walls — **a property of the operation, not the packing**. E17's own ledger demotes the E4 bridge to a **conjecture** (G/O/T never ran). Measure first = run the real external ops (distance/argmin/optimization) on the E17 rig to close that conjecture, then map LQL aggregate verbs. **MEASURED ✅ (2026-06-07, conjecture REFINED):** ran the real external ops on the E17 rig — **DIST (geometric) + ARGMIN (selection) RIDE free at L1**, only **PARTITION (global optimization) walls like parity**. Parity was NOT a fair stand-in for "external"; E4 mis-files geometric/selection (they're internal). Real line = factors-through-reads vs global-joint. Dispatch consequence: keep count/filter/aggregate/threshold/majority/distance/argmin internal, route global-optimization+parity external. `fleet/E17_compute_ladder/E17_EXTERNAL_VERDICT.md`. Build (far): in-band eval + external dispatch per the re-cut criterion. | larql-lql, larql-router, larql-vindex | **measured ✅ (conjecture refined)** |
 
 ---
 
