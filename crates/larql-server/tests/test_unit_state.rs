@@ -81,6 +81,7 @@ fn make_tiny_model(id: &str) -> Arc<LoadedModel> {
             model_config: None,
             fp4: None,
             ffn_layout: None,
+            bitnet_layout: None,
         },
         patched: std::sync::Arc::new(tokio::sync::RwLock::new(patched)),
         embeddings: Array2::<f32>::zeros((4, hidden)),
@@ -160,6 +161,7 @@ fn make_loaded_model_for_warmup() -> Arc<LoadedModel> {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     let tok_json =
@@ -386,6 +388,7 @@ fn test_config_has_inference_capability() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     // Browse level → no inference
@@ -1266,6 +1269,7 @@ fn test_infer_weights_required() {
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
     // Browse level + no model weights → can't infer
     let can_infer = config.has_model_weights

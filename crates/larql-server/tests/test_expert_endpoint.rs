@@ -229,6 +229,7 @@ fn make_loaded_model(
         model_config: None,
         fp4: None,
         ffn_layout: None,
+        bitnet_layout: None,
     };
 
     // Build ModelWeights with expert data in raw_bytes (no mmap needed).
