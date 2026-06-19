@@ -279,6 +279,7 @@ fn make_loaded_model(
         embed_store: None,
         release_mmap_after_request: false,
         weights: lock,
+        weights_init: std::sync::Mutex::new(()),
         probe_labels: HashMap::new(),
         ffn_l2_cache: FfnL2Cache::new(1),
         layer_latency_tracker: std::sync::Arc::new(
