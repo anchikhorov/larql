@@ -870,6 +870,31 @@ stages, smallest-blast first:
     decode vs Stage 2a is the regression spine; (3) the canonical-empty shaping
     above. With these, the reader conversion is mechanical and the silent-break
     class is closed by construction.
+
+    **Stage 2b progress + the reader-family finding (2026-06-20).** Done +
+    committed behavior-identical: all THREE "primary" quant-path readers now
+    take `WeightsView` — `run_attention_with_kv_backend` (Stage 1),
+    `dense_ffn_forward` (Stage 2a), `run_attention_block_decode_step_backend`
+    (Stage 2b-pre). The Q4K **decode** oracle is captured
+    (`bench/oracles/q4k_qwen3_history_of_computing.txt`, 24-token greedy on
+    `qwen3-0.6b-q4k.vindex`). The relocation proper (inserters→scratch,
+    `ViewFfn`, wire the cached prefill+decode loops, drop `&mut`) was drafted
+    and reverted to green when the **secondary** loops (`hidden.rs`,
+    `interventions.rs`) surfaced that the reader set is *still* expanding on
+    contact: they reach attention through `run_layer_with_ffn` →
+    `run_attention_inner` / `run_attention_with_kv_cache` →
+    `run_attention_block_core` (block.rs) + `run_attention_block_gpu` (gpu.rs)
+    — **un-converted readers the grep never surfaced**, exactly the
+    "current-not-complete" inventory. So the true relocation scope is "convert
+    the **whole attention-reader family**" (with_kv_backend✓ / decode✓ /
+    block_core / block_gpu / inner / with_kv_cache), each a Stage-1-style
+    cascade through a widely-used fn — several more passes, not one. The cached
+    decode path (the oracle path) wired cleanly; the secondary loops need the
+    rest of the family first. **Loud-break makes this safe to do incrementally**
+    (canonical empty of dequant keys → a missed reader gets `None` → the
+    existing `.unwrap_or_else(panic)` fires on first decode, loud not silent),
+    so each remaining reader can be converted + the loop wired + validated
+    against the oracle without a silent miscompilation risk.
   - **P-B.2 — Arc-owned weights.** Every weight param is now `&ModelWeights`;
     move it into engine construction (engines hold `Arc<ModelWeights>`) and drop
     the param from prefill/decode/quant/resident/executor variants. ~171 call
