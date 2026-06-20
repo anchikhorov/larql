@@ -757,22 +757,39 @@ Scoping fixed the magnitude — BitNet has **zero CLI/server hookup today**
 is a chain of early-return mode branches (experts / ffn / moe / image). Three
 stages, smallest-blast first:
 
-- **P-A — Serve BitNet from `larql run` + the server (no trait change).** Add
-  a BitNet branch in `run_cmd::run()` (and the server stream routes) that, on
-  `config.bitnet_layout.is_some()`, loads via `load_bitnet_model` and drives
-  `ternary::generate_streaming_bitnet`, alongside the existing
-  `experts`/`image` early returns. This is the actual "users can run it" win
-  and is additive/low-risk. **Start here.** Needs a real BitNet vindex to
-  smoke-test (convert one with `--keep-quant`). Does NOT make BitNet a
-  `KvEngine` — it bridges at the run layer.
+- **P-A — Serve BitNet from `larql run` (CLI) — ✅ BEHAVIOUR-VERIFIED
+  2026-06-20.** `run_cmd::run()` branches on `config.bitnet_layout.is_some()`
+  and drives `ternary::generate_streaming_bitnet` (greedy stream + chat REPL),
+  bypassing the dense `walk_cmd` path. Smoke-tested against
+  `~/larql-vindex/bitnet-2b.vindex`:
+  `larql run <vindex> "The capital of France is" -n 16` →
+  `" Paris. Paris is a city that is known for its rich history, culture,"` —
+  deterministic across runs. **This greedy output is the P-B regression
+  oracle** (saved local-only at `bench/oracles/bitnet_2b_capital_of_france.txt`;
+  not committed — depends on the >1 GB vindex; repro = the command above).
+  Bridges at the run layer; does NOT make BitNet a `KvEngine`.
+  *Remaining (deferred to AFTER P-B, deliberately): server stream-route wiring
+  + chat-template/sampling parity — wiring the server now would thread
+  `&ModelWeights` through the hot path B1 is about to strip; wire once, after.*
 - **P-B — First-class `KvEngine` (the structural refactor).** Blast radius
   measured: **8 production engine impls + ~171 `prefill`/`decode_step` call
   sites + `EngineKind`/`AnyEngine`**. The one-way-door is the trait shape;
   pick before the breaking change:
-  - **B1 (recommended): engines own their weights.** Move `&ModelWeights` out
-    of `prefill`/`decode_step` into engine construction (engines hold
-    `Arc<ModelWeights>`); `BitnetEngine` holds `Arc<BitnetModel>`. Cleanest
-    long-term; mostly-mechanical churn across the 8 engines + call sites.
+  - **B1 (CHOSEN 2026-06-20): engines own their weights.** Move `&ModelWeights`
+    out of `prefill`/`decode_step` into engine construction (engines hold
+    `Arc<ModelWeights>`); `BitnetEngine` holds `Arc<BitnetModel>`.
+    **Read-only check (done):** dense `prefill`/`decode_step` and the
+    `*_resident` path take `&ModelWeights` (read-only — B1-clean); BitNet
+    weights are final (no mutation). BUT the **quant-resident path
+    (`prefill_quant`/`decode_step_quant`) takes `&mut ModelWeights`** — it
+    memoizes resident-quant buffers back into the struct. So B1 is NOT pure
+    mechanical churn; it bundles one design sub-decision for that path:
+    **(a)** relocate the resident-quant memoization out of `ModelWeights` into
+    engine-owned derivative state (recommended — lands on the StatePolicy
+    split: canonical weights immutable, derived caches are engine state), or
+    **(b)** `Arc<ModelWeights>` + interior mutability (`OnceCell`/`RwLock`) on
+    just the resident-quant fields (smaller, keeps derived state in the
+    canonical struct). Cost = ~171 mechanical sites + this sub-decision.
   - **B2: `&dyn ModelSource` param.** New trait; `&ModelWeights` auto-coerces
     so most call sites are untouched, but the trait must mirror the slice of
     `ModelWeights` engines use, and BitNet panics on dense-only methods.
