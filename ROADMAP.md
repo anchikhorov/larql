@@ -955,6 +955,27 @@ stages, smallest-blast first:
     pattern is mechanical but keeps surfacing forward helpers on contact (the
     reader-family expansion, now in the engine layer) — a focused dedicated pass.
     `git stash list` → "no-shims WIP".
+
+    **Convergence measurement (2026-06-21).** Resumed the sweep and pushed into
+    the engines. Additional shared decode/recompute readers converted to
+    `WeightsView` (these are real foundation, beyond the StandardEngine work):
+    `run_attention_block_decode_step_auto` + `_auto_inplace` (the resident-decode
+    switcher used by **5 engines** — q4k-direct branch reads native index bytes
+    via `.canonical()`, f32 branch threads the view), `kv_prefill_run`
+    (no_cache + standard), `recompute_kv` + `attn_kv_projection_weights`
+    (boundary + markov), and **NoCacheEngine** fully (field + view-thread +
+    `&mut` drop, clean). **But the larql-kv error count DIVERGED as I converted:
+    28 → 45 → 67.** Each engine's `walk.rs`/`compute.rs` forward module is a deep
+    chain (engine → walk → recompute → projection → `weights.tensors`), and
+    converting one helper exposes its callers + their internal reads. This is the
+    reader-family expansion at its widest — **converting every engine's full
+    forward/recompute internals** (~30-50+ functions across 6 engine modules +
+    apollo's `forward_raw_logits` + the dev drivers). The diverging count is the
+    decision signal: this is a **staged multi-session refactor**, best done one
+    engine module at a time (convert its walk+compute internals, validate that
+    engine against a per-engine oracle, commit), not a single grind. The shared
+    helpers above are the foundation already laid; the per-engine internals are
+    the remaining bulk. WIP re-stashed.
   - **P-B.2 — Arc-owned weights.** Every weight param is now `&ModelWeights`;
     move it into engine construction (engines hold `Arc<ModelWeights>`) and drop
     the param from prefill/decode/quant/resident/executor variants. ~171 call
