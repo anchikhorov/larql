@@ -748,6 +748,42 @@ G3's framing was falsified. Detail per item:
   the scalar-vs-AVX2 bit-exact test (already the pattern for the NEON twin)
   can gate it. x86_64 keeps the correct scalar-A8 path (~2.4×) meanwhile.
 
+### Productization plan (decision: PRODUCTIZE, 2026-06-20)
+
+Direction chosen: make BitNet a real served path, not a validated experiment.
+Scoping fixed the magnitude — BitNet has **zero CLI/server hookup today**
+(`load_bitnet_model` is called only from the example); the dense run path is
+`layer_graph::generate_streaming` over the engine dispatch; `run_cmd::run()`
+is a chain of early-return mode branches (experts / ffn / moe / image). Three
+stages, smallest-blast first:
+
+- **P-A — Serve BitNet from `larql run` + the server (no trait change).** Add
+  a BitNet branch in `run_cmd::run()` (and the server stream routes) that, on
+  `config.bitnet_layout.is_some()`, loads via `load_bitnet_model` and drives
+  `ternary::generate_streaming_bitnet`, alongside the existing
+  `experts`/`image` early returns. This is the actual "users can run it" win
+  and is additive/low-risk. **Start here.** Needs a real BitNet vindex to
+  smoke-test (convert one with `--keep-quant`). Does NOT make BitNet a
+  `KvEngine` — it bridges at the run layer.
+- **P-B — First-class `KvEngine` (the structural refactor).** Blast radius
+  measured: **8 production engine impls + ~171 `prefill`/`decode_step` call
+  sites + `EngineKind`/`AnyEngine`**. The one-way-door is the trait shape;
+  pick before the breaking change:
+  - **B1 (recommended): engines own their weights.** Move `&ModelWeights` out
+    of `prefill`/`decode_step` into engine construction (engines hold
+    `Arc<ModelWeights>`); `BitnetEngine` holds `Arc<BitnetModel>`. Cleanest
+    long-term; mostly-mechanical churn across the 8 engines + call sites.
+  - **B2: `&dyn ModelSource` param.** New trait; `&ModelWeights` auto-coerces
+    so most call sites are untouched, but the trait must mirror the slice of
+    `ModelWeights` engines use, and BitNet panics on dense-only methods.
+  - **B3: `ModelWeights` gains a ternary representation.** Smallest type diff
+    but leaks ternary-awareness into the dense engines — rejected.
+  Do P-B as its own PR after P-A proves the path; hold parity per the 7-spec
+  `resident_identity_tests` discipline.
+- **P-C — G4 AVX2 + x86 CI.** Add a Linux-x86 CI job; land the AVX2 twin gated
+  by the scalar-vs-AVX2 bit-exact test (the NEON-twin pattern). Independent of
+  P-A/P-B; unblocks G4's environment blocker.
+
 ---
 
 ## Demo narrative
