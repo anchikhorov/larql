@@ -805,11 +805,30 @@ stages, smallest-blast first:
   (a `HashMap`) keyed by `arch.attn_{q,k,v,o}_key(layer)`, idempotent, and the
   forward reads them back from that map. Pure derivative state. Stages, each
   compilable + checked against the captured greedy oracle:
-  - **P-B.1 — relocate the dequant cache.** Move the dequantised-attention
-    `HashMap` out of `weights.tensors` into engine-owned state and consult it
-    at the forward's tensor-read sites (resolver: engine cache → canonical
-    weights). Drops the `&mut` from `prefill_quant`/`decode_step_quant`. Touches
-    the Q4K residency path — `resident_identity_tests` + the oracle guard it.
+  - **P-B.1 — relocate the dequant cache (HOME LOCKED: engine, not
+    `ModelWeights`; concurrency evidence 2026-06-20).** Move the dequantised-
+    attention `HashMap` out of `weights.tensors` into **engine-owned** state and
+    consult it at the forward's tensor-read sites (resolver: engine cache →
+    canonical weights). Drops the `&mut` from `prefill_quant`/`decode_step_quant`.
+    *Why engine, not an interior-mutable `RwLock` field on `ModelWeights`:* the
+    scratch is **transient** (per-layer evicted for the memory bound) → per-
+    forward state, not a persistent cache. The server holds one
+    `weights: OnceLock<RwLock<ModelWeights>>` and **serializes every generation
+    behind an exclusive write lock** (`state.rs:186 lock_weights_for_gen`,
+    used by all OpenAI gen routes) *specifically because* this dequant mutation
+    makes weights non-immutable ("concurrent reads block while a generation is
+    in flight"). An interior-mut `RwLock` field can't lift that — two forwards
+    sharing one `Arc` would clobber each other's evicting scratch, so gen would
+    still have to serialize (and the dense 117 tok/s path would pay a per-resolve
+    read-lock + `ArcArray` clone for a scratch that's always empty for it).
+    Engine-owned scratch makes `ModelWeights` **truly immutable** →
+    `Arc<ModelWeights>` shared across **concurrent** generations, each engine
+    its own cache (no lock, no race, no tax) — the actual payoff of the refactor.
+    Resolver threads as `&mut self.dequant_cache` from the engine (it's already
+    the `&mut self` forward context). Touches the Q4K residency path —
+    `resident_identity_tests` + the oracle guard it. *(A provisional
+    `RwLock`-in-`ModelWeights` impl was tried this session and reverted on this
+    evidence before the read-site/trait sweep could cement it.)*
   - **P-B.2 — Arc-owned weights.** Every weight param is now `&ModelWeights`;
     move it into engine construction (engines hold `Arc<ModelWeights>`) and drop
     the param from prefill/decode/quant/resident/executor variants. ~171 call
