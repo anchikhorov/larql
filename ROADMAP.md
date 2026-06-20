@@ -608,6 +608,123 @@ Themes, in leverage order (concrete first steps live in hardening items
 
 ---
 
+## BitNet b1.58 integration hardening (added 2026-06-20)
+
+Native-ternary BitNet (`microsoft/bitnet-b1.58-2B-4T`) landed on
+`feat/quant-ternary-a8`. The **W1.58·A8 kernel work in `larql-compute`
+is the strongest part and fits the architecture cleanly**: ternary matvec
+lives in `cpu/ops/ternary_matvec.rs` alongside the q4k/q6k kernels, follows
+the `_into` allocation-free convention, and is parity-disciplined —
+dequant-reference parity, **bit-exact NEON-vs-scalar across `cols % 16`
+tails**, and shape-guard rejection tests. NEON gives ~12–13× the f32
+reference on BitNet shapes; x86_64 has the scalar-A8 ~2.4× today.
+
+The **system-level integration is a deliberate parallel stack** — a fresh
+instance of the consolidation-track theme above (parallel path created to
+avoid destabilising a parity-verified one). BitNet bypasses every shared
+seam: `QuantFormat`/`FormatRoute` dispatch, the `KvEngine` trait,
+`larql-kv::KvCache`, the models arch registry, and the vindex build
+pipeline. This is documented as intentional pending the FormatRoute
+roadmap and is a defensible MVP posture for a narrowly-scoped path. The
+module comment that gated folding-in on "once the quantised-activation
+kernel exists" now has its precondition met (this branch), so the
+promotion-or-isolation decision the policy box demands is no longer
+blocked — it is made explicit below (the G1–G4 structural items), with the
+2026-06-20 hardening pass clearing the quick wins first.
+
+Per-crate status:
+
+- **`larql-compute`** — fits. Kernel + tests land in the right module with
+  the right discipline. The earlier doc inaccuracy (header implied the path
+  already routes through `FormatRoute`) is **reconciled**: `QuantFormat`
+  (`pipeline.rs:25-34`) still has no ternary variant, `from_registry_tag`
+  (`pipeline.rs:104-116`) maps no ternary tag, and the `QuantMatVec` dispatch
+  trait has no ternary arm — `BitLinearWeight` is reachable only by direct
+  call, and the docstring now says so plainly (dispatch integration is the
+  open structural item, not done).
+- **`larql-inference`** — bespoke parallel stack. `BitnetModel` is not a
+  `KvEngine`; `BitnetKvCache` is a hand-rolled `Vec<Array2<f32>>` rather
+  than `larql-kv::KvCache`, so none of the KV append-in-place / windowing /
+  surgery work applies. Entry is direct (`load_bitnet_model` → `generate`),
+  no unified dispatch picks between dense and ternary. (The hot path now
+  quantises the shared activation once per Q/K/V and gate/up, and the header
+  comment reflects the now-met kernel precondition — the structural
+  KvEngine/shared-cache fold remains open.)
+- **`larql-vindex`** — `bitnet_writer`/`bitnet_loader` write a `bitnet/`
+  sidecar (`*.i2s` + `scales.f32` + `bitnet_layout.json`) and patch
+  `index.json` with a `bitnet_layout` field, independent of the
+  `quant: QuantFormat` enum field (two parallel quant-tag mechanisms).
+  Writer is a post-build patch from `convert_cmd.rs`, not part of the build
+  pipeline.
+- **`larql-models`** — was the fragile seam; **FIXED 2026-06-20**.
+  `"bitnet-*"` is now recognised explicitly in `detect/mod.rs` and routes to
+  a thin named `BitnetArch` (`architectures/bitnet.rs`, `family() ==
+  "bitnet"`, Llama-style defaults, `norm_eps` honoured from config) instead
+  of silently collapsing to `GenericArch`. Native-ternary inference is still
+  served by the `larql-inference` ternary path, not this trait; `BitnetArch`
+  is the home for first-class overrides when BitNet graduates. Covered by
+  `test_detect_bitnet_is_explicit_not_generic`.
+
+### Completed — hardening pass (2026-06-20)
+
+The quick-win review items landed; all touched crates build clean and
+clippy-clean (`--all-targets`), tests green (compute ternary 19/19,
+inference ternary 28/28 incl. the FFN A8-vs-f32 parity gate, models detect
+59/59):
+
+1. ✅ **[larql-models] Killed the silent `GenericArch` fallback** — explicit
+   `bitnet-*` recognition → thin named `BitnetArch`; `norm_eps` honoured;
+   `test_detect_bitnet_is_explicit_not_generic`. *(was P1)*
+2. ✅ **[larql-compute] Reconciled the `ternary_matvec.rs` docstring** — no
+   longer implies the path routes through `FormatRoute`; states that dispatch
+   integration is the open item and the kernel is reached by direct call.
+3. ✅ **[larql-inference] Reuse one activation quant** — Q/K/V and gate/up
+   quantise the shared activation once (`quantize_activation_i8` +
+   `matvec_i2s_a8_into`) across all five forward sites. Bit-exact (parity
+   tests unchanged), saves the repeat int8 quantise per projection.
+4. ✅ **[larql-inference] Refreshed the `ternary.rs` header comment** — the
+   "fold in once the quant-activation kernel exists" precondition is now met;
+   the comment frames the fold as live roadmap work, not a missing dependency.
+5. ✅ **[larql-compute] x86_64 gap documented** — verified already clear at
+   the dispatch entry (`matvec_i2s_a8_into`: "scalar int8 elsewhere — AVX2
+   twin is the x86_64 follow-up") and the status block.
+
+Owed back to the user (not a code change):
+
+6. **[git hygiene] Split the `pipeline_layer.rs` refactor** — the
+   `attn_str_to_format`/`ffn_str_to_format` → `from_registry_tag` dedup is a
+   sound single-source-of-truth cleanup but is **orthogonal to BitNet**
+   (BitNet never flows through `resolve_ffn_weights`). Land it as its own
+   "refactor: dedupe tag→format mapping" commit, not inside the feature.
+
+### Remaining — graduation to first-class (structural, sequenced)
+
+These are the real "promote or isolate" decisions from the policy box; none
+are blocked anymore (the A8/NEON kernel precondition is met). Sequence them
+only if BitNet earns a second consumer or moves off example-only — until
+then the no-premature-extraction rule says isolated-but-explicit is fine.
+
+- **G1 — `QuantFormat` ternary variant + dispatch arm** [larql-compute].
+  Add an I2_S/ternary `QuantFormat` (+ `from_registry_tag` tag) and a
+  `QuantMatVec` arm so the A8 kernel is reachable through the registry, not
+  only by direct call. Precondition for G2/G3 sharing the dense dispatch.
+- **G2 — `KvEngine` impl for BitNet + shared `larql-kv::KvCache`**
+  [larql-inference]. Replace bespoke `BitnetKvCache` with `larql-kv::KvCache`
+  and implement `KvEngine` for the BitNet forward so it rides
+  append-in-place / windowing / surgery and a unified dispatch picks between
+  dense and ternary. Folds onto the forward-pass spine (consolidation-track
+  item 1). Largest item; gated on G1.
+- **G3 — vindex quant-tag unification** [larql-vindex]. Fold the
+  `bitnet_layout` sidecar tag into the same quant-format registry the
+  `quant: QuantFormat` field uses (one mechanism, not two), and move
+  `bitnet_writer` into the build pipeline rather than a `convert_cmd`
+  post-patch.
+- **G4 — AVX2 `_mm256_sign_epi8` sign-select twin** [larql-compute]. Gives
+  x86_64 the full SIMD win (it has scalar-A8 ~2.4× today); independent of
+  G1–G3, do whenever Linux/Windows server throughput matters.
+
+---
+
 ## Demo narrative
 
 ### Act 1 — "The model is the database"
