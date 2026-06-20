@@ -697,31 +697,56 @@ Owed back to the user (not a code change):
    (BitNet never flows through `resolve_ffn_weights`). Land it as its own
    "refactor: dedupe tag→format mapping" commit, not inside the feature.
 
-### Remaining — graduation to first-class (structural, sequenced)
+### Remaining — graduation to first-class (status 2026-06-20 after scoping)
 
-These are the real "promote or isolate" decisions from the policy box; none
-are blocked anymore (the A8/NEON kernel precondition is met). Sequence them
-only if BitNet earns a second consumer or moves off example-only — until
-then the no-premature-extraction rule says isolated-but-explicit is fine.
+Close contact with the code (two scoping passes) revised this list: only G1
+was cleanly doable on the current machine. G2 and G4 hit genuine blockers and
+G3's framing was falsified. Detail per item:
 
-- **G1 — `QuantFormat` ternary variant + dispatch arm** [larql-compute].
-  Add an I2_S/ternary `QuantFormat` (+ `from_registry_tag` tag) and a
-  `QuantMatVec` arm so the A8 kernel is reachable through the registry, not
-  only by direct call. Precondition for G2/G3 sharing the dense dispatch.
-- **G2 — `KvEngine` impl for BitNet + shared `larql-kv::KvCache`**
-  [larql-inference]. Replace bespoke `BitnetKvCache` with `larql-kv::KvCache`
-  and implement `KvEngine` for the BitNet forward so it rides
-  append-in-place / windowing / surgery and a unified dispatch picks between
-  dense and ternary. Folds onto the forward-pass spine (consolidation-track
-  item 1). Largest item; gated on G1.
-- **G3 — vindex quant-tag unification** [larql-vindex]. Fold the
-  `bitnet_layout` sidecar tag into the same quant-format registry the
-  `quant: QuantFormat` field uses (one mechanism, not two), and move
-  `bitnet_writer` into the build pipeline rather than a `convert_cmd`
-  post-patch.
-- **G4 — AVX2 `_mm256_sign_epi8` sign-select twin** [larql-compute]. Gives
-  x86_64 the full SIMD win (it has scalar-A8 ~2.4× today); independent of
-  G1–G3, do whenever Linux/Windows server throughput matters.
+- **G1 — `QuantFormat` ternary variant + dispatch — ✅ DONE 2026-06-20.**
+  Added `QuantFormat::I2S` (+ `registry_tag`/`from_registry_tag` round-trip,
+  `is_ternary`), a dedicated `QuantMatVec::ternary_matvec` method (a
+  `BitLinearWeight` carries the per-channel scales the `&[u8]` `quant_matvec`
+  signature can't), and a `CpuBackend` impl on the best-available A8 kernel.
+  `quant_matvec` returns `None` for I2S (loud, like Q8_0); Metal panics (no
+  ternary shader). Registry-reachable now, not only by direct call. Tested +
+  clippy-clean.
+- **G2 — `KvEngine` impl + shared cache — BLOCKED on a breaking trait change
+  (your call).** Scoping (kv_engine.rs / larql-kv) found `KvEngine::prefill`
+  and `decode_step` are typed `(&ModelWeights, &dyn FfnBackend, …)` — dense
+  f32 weights. `BitnetModel` holds ternary `BitLinearWeight`s, an incompatible
+  container. Making BitNet a first-class `KvEngine` needs EITHER a
+  workspace-wide generalisation of the weight parameter to a `dyn` trait (real
+  breaking change, hot-path dyn dispatch — heavy for an example-only feature)
+  OR a type-lie (accept `&ModelWeights`, ignore it, route to an owned
+  `BitnetModel`) — rejected as exactly the parallel-path anti-pattern the
+  policy box forbids. The cache-only sub-part (`BitnetKvCache` →
+  `larql-kv::KvCache`) is shape-compatible but marginal (the shared cache
+  doesn't append-in-place for this path either) and carries hot-path parity
+  risk, and it does NOT reach "first-class". → Decision: take the breaking
+  trait generalisation, or leave BitNet isolated-but-explicit (recommended
+  until a second consumer exists).
+- **G3 — vindex quant-tag unification — GOAL FALSIFIED; struck.** Scoping
+  found BitNet vindexes are **mixed**: the dense scaffold (`embed`, `lm_head`,
+  `output_norm`) is f32 and loaded by the standard loader with
+  `skip_attn`/`skip_ffn`, while only attn/ffn are ternary. `quant:
+  QuantFormat::None` is therefore *correct* for the dense loader — setting
+  `quant: I2S` would mislead it into decoding the embedding as ternary. A
+  single `quant` tag cannot represent a mixed model; the two-field design
+  (`quant` for the dense scaffold + `bitnet_layout` manifest for the ternary
+  tensors) is the right shape. The only survivor is a modest mechanical
+  cleanup — move `bitnet_writer` from a `convert_cmd` read-modify-write
+  post-patch into the build pipeline so `index.json` is written once — low
+  payoff, invasive through the shared build path. Not pursued.
+- **G4 — AVX2 `_mm256_sign_epi8` twin — BLOCKED on an x86 build/test box.**
+  Design is clear (decode trit codes → a `{-1,0,+1}` int8 control, one
+  `_mm256_sign_epi8(x, control)`, widen-accumulate; bit-identical to scalar).
+  But this aarch64 machine can neither runtime-validate the SIMD NOR even
+  compile-check it (cross-`check` fails in the C-FFI build script — no
+  `x86_64-linux-gnu-gcc`). Committing unbuilt, unvalidated intrinsics violates
+  the parity discipline. → Defer to an x86 dev box / Linux CI runner, where
+  the scalar-vs-AVX2 bit-exact test (already the pattern for the NEON twin)
+  can gate it. x86_64 keeps the correct scalar-A8 path (~2.4×) meanwhile.
 
 ---
 
