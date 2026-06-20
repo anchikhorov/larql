@@ -918,6 +918,43 @@ stages, smallest-blast first:
     after the family conversion and after the relocation. **Follow-up:** the
     `*_resident` bulk path is still `&mut` — dropping it needs engine-owned
     scratch state (folds into P-B.2/P-B.3, not a blocker); loud-break guards it.
+
+    **P-B.1b — "no shims" full sweep (scoped 2026-06-20; WIP stashed).** Going
+    for zero `weights.tensors.extend` shims surfaced a **second `kquant_forward`
+    implementation**: the production `larql run` decode dispatches via KvEngines
+    → `coarse_prefill` → **larql-compute's** `kquant_forward` (1005 lines), NOT
+    the larql-inference copy (1772 lines) that P-B.1 relocated. The
+    larql-inference copy serves the direct-`predict_kquant`/AVE/hidden paths and
+    is validated by the 50 kquant unit tests; **the e2e oracle actually
+    exercises larql-compute's copy** (so the family conversion — shared
+    `run_attention_*` — was oracle-validated, but the larql-inference relocation
+    was unit-test-validated, not oracle). The full no-shim change is large and
+    interconnected:
+    (1) relocate **larql-compute's** `kquant_forward` too (cached/decode loops →
+        forward-local scratch + `ViewFfn`) — DONE in the stash, the real oracle
+        path now no-shim;
+    (2) `KvDispatch` (5 methods) + the 7 dispatch helpers + `AsyncComputeBackend`
+        + cpu/metal impls → `WeightsView` — DONE in the stash;
+    (3) coarse path (`coarse_prefill`/`coarse_decode_step`) drops `&mut` (delegates
+        to the now-`&` `predict_kquant_*`) — DONE;
+    (4) `KvEngine`/`RetrievalEngine` trait quant methods → `&ModelWeights`;
+        `RetrievalEngine::prefill_quant` default → loud error (apollo overrides;
+        the `ffn`-less `prefill` can't thread a scratch) — DONE;
+    (5) **engine-scratch design** (validated on `StandardEngine`): each engine
+        owns a `dequant_scratch: DequantScratch`; `do_prefill`/`do_decode_step`
+        build `WeightsView::with_scratch(weights, &self.dequant_scratch)` — the
+        view borrows `self.dequant_scratch` while `self.handles`/`self.backend`
+        are borrowed disjointly, so **no take/restore dance**; `prefill_quant`
+        dequants into the field, no merge. StandardEngine compiles clean.
+    Remaining (the stash is mid-sweep, ~29 errors): the **other 7 engines**
+    (no_cache, boundary×2, markov×2, turbo, unlimited, apollo) each need the
+    same field + view-thread + `&mut`-drop, plus their forward helpers
+    (`kv_prefill_run` + the `generate_cached_*` loops in larql-kv/generation.rs,
+    apollo's `forward_raw_logits`) converted to `WeightsView`, then the dev
+    drivers (ov_rd/lql/vision/examples) + delete the `*_resident` shims. The
+    pattern is mechanical but keeps surfacing forward helpers on contact (the
+    reader-family expansion, now in the engine layer) — a focused dedicated pass.
+    `git stash list` → "no-shims WIP".
   - **P-B.2 — Arc-owned weights.** Every weight param is now `&ModelWeights`;
     move it into engine construction (engines hold `Arc<ModelWeights>`) and drop
     the param from prefill/decode/quant/resident/executor variants. ~171 call
