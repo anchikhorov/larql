@@ -797,6 +797,30 @@ stages, smallest-blast first:
     but leaks ternary-awareness into the dense engines — rejected.
   Do P-B as its own PR after P-A proves the path; hold parity per the 7-spec
   `resident_identity_tests` discipline.
+
+  **Grounded execution stages (B1a chosen, real-code scope 2026-06-20).** The
+  `&mut` has a single chokepoint:
+  `larql_inference::vindex::dequant::ensure_attn_tensors_dequantised(&mut weights, index)`
+  (`vindex/dequant.rs:35`) — it dequantises Q4K Q/K/V/O into `weights.tensors`
+  (a `HashMap`) keyed by `arch.attn_{q,k,v,o}_key(layer)`, idempotent, and the
+  forward reads them back from that map. Pure derivative state. Stages, each
+  compilable + checked against the captured greedy oracle:
+  - **P-B.1 — relocate the dequant cache.** Move the dequantised-attention
+    `HashMap` out of `weights.tensors` into engine-owned state and consult it
+    at the forward's tensor-read sites (resolver: engine cache → canonical
+    weights). Drops the `&mut` from `prefill_quant`/`decode_step_quant`. Touches
+    the Q4K residency path — `resident_identity_tests` + the oracle guard it.
+  - **P-B.2 — Arc-owned weights.** Every weight param is now `&ModelWeights`;
+    move it into engine construction (engines hold `Arc<ModelWeights>`) and drop
+    the param from prefill/decode/quant/resident/executor variants. ~171 call
+    sites (all production, 0 in test files) + `EngineKind`/`AnyEngine`.
+    Compiler-driven — the safe kind of large churn.
+  - **P-B.3 — `BitnetEngine` + dispatch.** New engine holding
+    `Arc<BitnetModel>`, `impl KvEngine` over the ternary forward; add the
+    `EngineKind`/`AnyEngine` arm so unified dispatch picks ternary vs dense.
+  - **P-B.4 — validate** against the oracle (greedy "Paris…" byte-identical) +
+    the engine parity suite.
+  Best run in an isolated worktree so `main` stays stable through the change.
 - **P-C — G4 AVX2 + x86 CI.** Add a Linux-x86 CI job; land the AVX2 twin gated
   by the scalar-vs-AVX2 bit-exact test (the NEON-twin pattern). Independent of
   P-A/P-B; unblocks G4's environment blocker.
