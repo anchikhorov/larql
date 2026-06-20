@@ -829,6 +829,47 @@ stages, smallest-blast first:
     `resident_identity_tests` + the oracle guard it. *(A provisional
     `RwLock`-in-`ModelWeights` impl was tried this session and reverted on this
     evidence before the read-site/trait sweep could cement it.)*
+
+    **P-B.1 status (2026-06-20): signature stages DONE+committed, relocation
+    set up + reverted-to-green.** Done behavior-identical: `WeightsView`/
+    `DequantScratch` foundation; **Stage 1** (`run_attention_with_kv_backend` →
+    `WeightsView`, ~22 `dense()` wraps); **Stage 2a** (`dense_ffn_forward` →
+    `WeightsView`, `WeightFfn`/`BackendFfn` wrap `dense()` internally so the 326
+    `WeightFfn` construction sites stay untouched). The workspace-spanning
+    cross-crate signature diff is banked, decoupled from any behavior change,
+    each proven byte-identical by parity tests.
+
+    **Stage 2b (the relocation, behavior-changing) was reverted, and the reason
+    is categorical, not cost.** The first four blast-radius escalations
+    (RwLock→engine, cross-crate, 326-`WeightFfn`, decode reader) were all
+    *compiler-visible*: change a signature, the compiler enumerates callers. The
+    fifth is *type-system-invisible* — a reader that resolves `weights.tensors`
+    via `Deref` (canonical) while the scratch sits in an unconsulted
+    `DequantScratch` compiles clean, runs, and is wrong **only on the decode
+    path under a real Q4K vindex**. Holding that on a red tree across a session
+    boundary strands a miscompilation `cargo check` can't recover, so revert to
+    Stage 2a green was the only correctness-preserving move.
+
+    **Silent-break closure = make the miss LOUD, not enumerate readers.** The
+    grep inventory (`tensors.get(&arch.attn_*/ffn_*`) is *current, not complete*
+    — blind to precomputed-key reads, prefix iteration, accessor methods that
+    `.get` internally. The design fix: for a quant model those dequant keys were
+    **never** in canonical `tensors` (they only ever existed as the forward-time
+    mutation target being relocated), so if the relocation inserts only into
+    scratch and leaves canonical untouched, a missed reader resolves `None` →
+    the existing `.unwrap_or_else(panic)` / `?`-bail fires on first decode, on
+    any vindex. **Design property to enforce: leave canonical genuinely empty of
+    dequant keys (not shadowed)** → misses are loud by construction. Grep scopes
+    the conversion; the runtime catches its misses.
+
+    **Stage 2b entry conditions (all met — no upstream gap this time):**
+    (1) a Q4K vindex — **`~/larql-vindex/qwen3-0.6b-q4k.vindex` exists**;
+    (2) a **multi-token DECODE** oracle captured at Stage 2a (NOT prefill-only /
+    single-token — the decode reader is exactly the one Stage 1 missed, so a
+    prefill-heavy capture has a blind spot the shape of the bug); byte-identical
+    decode vs Stage 2a is the regression spine; (3) the canonical-empty shaping
+    above. With these, the reader conversion is mechanical and the silent-break
+    class is closed by construction.
   - **P-B.2 — Arc-owned weights.** Every weight param is now `&ModelWeights`;
     move it into engine construction (engines hold `Arc<ModelWeights>`) and drop
     the param from prefill/decode/quant/resident/executor variants. ~171 call
