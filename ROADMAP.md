@@ -895,6 +895,29 @@ stages, smallest-blast first:
     existing `.unwrap_or_else(panic)` fires on first decode, loud not silent),
     so each remaining reader can be converted + the loop wired + validated
     against the oracle without a silent miscompilation risk.
+
+    **✅ DONE (2026-06-20, `9650582e` + `f0da87cc`).** The whole-family
+    conversion + the relocation both landed. (1) `9650582e` converted the
+    entire attention-reader family to `WeightsView` — `block_core`, `block_gpu`,
+    `run_attention_inner`, `run_attention_with_kv_cache`, `run_layer_with_ffn`,
+    `run_layer_with_capture[_hooked]`, `run_attention_public` + the block.rs
+    family — ~100 callers `dense()`-wrapped across compute/inference/kv/cli/
+    server/examples, behavior-identical (the compiler enumerated the family for
+    me; the cascade bottoming out *is* the proof the inventory is now complete).
+    (2) `f0da87cc` did the relocation: the production decode path
+    (`predict_kquant_prefill/decode_step` + `hidden` + `interventions`)
+    dequantises into a forward-local `DequantScratch` resolved via
+    `WeightsView::with_scratch` + `ViewFfn` — **`weights` is `&ModelWeights`
+    (immutable, Arc-able) on the decode path, `&mut` dropped.** Bulk
+    f32-fallback + dev drivers (KvEngine `*_quant` trait defaults, all larql-kv
+    quant-engine overrides, apollo, ov_rd CLI, the lql relation resolver, the
+    vision/image CLI, examples) keep in-`weights` behaviour via `*_resident`
+    shims (dequant → scratch → merge into `weights.tensors`). Validated:
+    workspace `--all-targets` green, clippy 0 warnings, 50 kquant + 13 dequant +
+    resident_identity tests pass, decode **byte-identical to the oracle** both
+    after the family conversion and after the relocation. **Follow-up:** the
+    `*_resident` bulk path is still `&mut` — dropping it needs engine-owned
+    scratch state (folds into P-B.2/P-B.3, not a blocker); loud-break guards it.
   - **P-B.2 — Arc-owned weights.** Every weight param is now `&ModelWeights`;
     move it into engine construction (engines hold `Arc<ModelWeights>`) and drop
     the param from prefill/decode/quant/resident/executor variants. ~171 call
