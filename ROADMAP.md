@@ -187,6 +187,7 @@ Current state (2026-05-15):
 | **GPU (Metal)** | Gemma 4 + MTP (when adopted) | 88 tok/s no-MTP | ~225 with MTP | ~2.6× behind | far over |
 | **CPU** | Gemma 3 4B Q4K decode | **30.9 tok/s** (residency default-on, same-session 2026-06-13; was 24.5) | llama.cpp Q4_K_M CPU ~43 | **~1.42× behind** (was 1.69×) | over — the Q4_K residency + int8 + asm + spin-pool stack is now **default-on** (2026-06-13); earlier kernels (KV-cache, direct Q4_K matvec, NEON Q4_K/Q6_K/f32_dot, Q4 lm_head, par_chunks_mut(32), Q4_K×Q8_K sdot, auto-t=8) landed 2026-05-15/16, ~86× over the original 0.36 baseline. See `bench/baselines/cpu/DIAGNOSIS.md` |
 | **CPU** | Gemma 4 26B-A4B decode | in-proc KV-cached MoE **~35 tok/s** (spin pool, default-on; M3 Max t=8 warm n=256, 2026-06-13) | llama.cpp Q4_K_M CPU **32.1** (recorded, drift-bracketed) | **larql ~9% AHEAD** | ✅ **CAUGHT** — arc 7.6 → 13.9 (residency) → 21.7 (int8 attn) → 27.9 (KV append-in-place) → **~35 (spin-barrier pool)**. The final ~1.15× was **rayon fork-join overhead** (decode driver ran outside the pool → ~211 cold-path sections/token, ~40% of thread-time in waits), *not* kernel quality — closed by the spin pool (effective-bandwidth/scheduling, exactly as the C12 roofline-crossover entry predicted), shipped **default-on**. Caveat: the 26B llama.cpp anchor is the recorded 32.1 (ollama wouldn't run the HF GGUF on CPU this session); machine validated via 4B llama.cpp 44 ≈ recorded 43. `bench/baselines/c10_gemma4-26b-a4b_cpu_reconciled.json`. |
+| **CPU** | Gemma 3 4B Q4K **prefill** (5-tok) | **233 ms** (q4k/q6k-direct attn+FFN + NEON dot; standard engine, 2026-06-22; was 2746 ms / ~2 tok/s) | llama.cpp pp5 ~70 ms | **~3.3× behind** (was 55×) | closing — eliminated the per-layer f32 dequant: Q/K/V/O **and** gate/up/down project straight from the Q4_K/Q6_K vindex bytes via amortised `q4k_matmul` / `q6k_matmul` (the Q6_K twin, for the default Q6_K `v_proj`/`down_proj`) with a hand-written aarch64 NEON inner dot that *beats* f32 AMX sgemm at seq=5. A Q6_K-`down_proj` mis-decode (format-tag dispatch) was caught in review and fixed before this number. Remaining gap is matmul constant-factor + batched attention, not dequant. Also de-duplicated the larql-inference↔larql-compute Q4_K forward (one substrate copy). `bench/baselines/cpu/COMPARISON.md` |
 
 Items the threshold makes load-bearing (not optional) on the **GPU track**:
 - **D-ATTN-MTG** — flash attention; without it, attention-mechanism deltas are muddied by missing baseline.
@@ -605,6 +606,420 @@ Themes, in leverage order (concrete first steps live in hardening items
    untracked/half-tracked; adopt the rule that `_`-prefixed artifacts are
    gitignored, and reconciled baselines get real names + a RUNBOOK line.
    [bench]
+
+---
+
+## BitNet b1.58 integration hardening (added 2026-06-20)
+
+Native-ternary BitNet (`microsoft/bitnet-b1.58-2B-4T`) landed on
+`feat/quant-ternary-a8`. The **W1.58·A8 kernel work in `larql-compute`
+is the strongest part and fits the architecture cleanly**: ternary matvec
+lives in `cpu/ops/ternary_matvec.rs` alongside the q4k/q6k kernels, follows
+the `_into` allocation-free convention, and is parity-disciplined —
+dequant-reference parity, **bit-exact NEON-vs-scalar across `cols % 16`
+tails**, and shape-guard rejection tests. NEON gives ~12–13× the f32
+reference on BitNet shapes; x86_64 has the scalar-A8 ~2.4× today.
+
+The **system-level integration is a deliberate parallel stack** — a fresh
+instance of the consolidation-track theme above (parallel path created to
+avoid destabilising a parity-verified one). BitNet bypasses every shared
+seam: `QuantFormat`/`FormatRoute` dispatch, the `KvEngine` trait,
+`larql-kv::KvCache`, the models arch registry, and the vindex build
+pipeline. This is documented as intentional pending the FormatRoute
+roadmap and is a defensible MVP posture for a narrowly-scoped path. The
+module comment that gated folding-in on "once the quantised-activation
+kernel exists" now has its precondition met (this branch), so the
+promotion-or-isolation decision the policy box demands is no longer
+blocked — it is made explicit below (the G1–G4 structural items), with the
+2026-06-20 hardening pass clearing the quick wins first.
+
+Per-crate status:
+
+- **`larql-compute`** — fits. Kernel + tests land in the right module with
+  the right discipline. The earlier doc inaccuracy (header implied the path
+  already routes through `FormatRoute`) is **reconciled**: `QuantFormat`
+  (`pipeline.rs:25-34`) still has no ternary variant, `from_registry_tag`
+  (`pipeline.rs:104-116`) maps no ternary tag, and the `QuantMatVec` dispatch
+  trait has no ternary arm — `BitLinearWeight` is reachable only by direct
+  call, and the docstring now says so plainly (dispatch integration is the
+  open structural item, not done).
+- **`larql-inference`** — bespoke parallel stack. `BitnetModel` is not a
+  `KvEngine`; `BitnetKvCache` is a hand-rolled `Vec<Array2<f32>>` rather
+  than `larql-kv::KvCache`, so none of the KV append-in-place / windowing /
+  surgery work applies. Entry is direct (`load_bitnet_model` → `generate`),
+  no unified dispatch picks between dense and ternary. (The hot path now
+  quantises the shared activation once per Q/K/V and gate/up, and the header
+  comment reflects the now-met kernel precondition — the structural
+  KvEngine/shared-cache fold remains open.)
+- **`larql-vindex`** — `bitnet_writer`/`bitnet_loader` write a `bitnet/`
+  sidecar (`*.i2s` + `scales.f32` + `bitnet_layout.json`) and patch
+  `index.json` with a `bitnet_layout` field, independent of the
+  `quant: QuantFormat` enum field (two parallel quant-tag mechanisms).
+  Writer is a post-build patch from `convert_cmd.rs`, not part of the build
+  pipeline.
+- **`larql-models`** — was the fragile seam; **FIXED 2026-06-20**.
+  `"bitnet-*"` is now recognised explicitly in `detect/mod.rs` and routes to
+  a thin named `BitnetArch` (`architectures/bitnet.rs`, `family() ==
+  "bitnet"`, Llama-style defaults, `norm_eps` honoured from config) instead
+  of silently collapsing to `GenericArch`. Native-ternary inference is still
+  served by the `larql-inference` ternary path, not this trait; `BitnetArch`
+  is the home for first-class overrides when BitNet graduates. Covered by
+  `test_detect_bitnet_is_explicit_not_generic`.
+
+### Completed — hardening pass (2026-06-20)
+
+The quick-win review items landed; all touched crates build clean and
+clippy-clean (`--all-targets`), tests green (compute ternary 19/19,
+inference ternary 28/28 incl. the FFN A8-vs-f32 parity gate, models detect
+59/59):
+
+1. ✅ **[larql-models] Killed the silent `GenericArch` fallback** — explicit
+   `bitnet-*` recognition → thin named `BitnetArch`; `norm_eps` honoured;
+   `test_detect_bitnet_is_explicit_not_generic`. *(was P1)*
+2. ✅ **[larql-compute] Reconciled the `ternary_matvec.rs` docstring** — no
+   longer implies the path routes through `FormatRoute`; states that dispatch
+   integration is the open item and the kernel is reached by direct call.
+3. ✅ **[larql-inference] Reuse one activation quant** — Q/K/V and gate/up
+   quantise the shared activation once (`quantize_activation_i8` +
+   `matvec_i2s_a8_into`) across all five forward sites. Bit-exact (parity
+   tests unchanged), saves the repeat int8 quantise per projection.
+4. ✅ **[larql-inference] Refreshed the `ternary.rs` header comment** — the
+   "fold in once the quant-activation kernel exists" precondition is now met;
+   the comment frames the fold as live roadmap work, not a missing dependency.
+5. ✅ **[larql-compute] x86_64 gap documented** — verified already clear at
+   the dispatch entry (`matvec_i2s_a8_into`: "scalar int8 elsewhere — AVX2
+   twin is the x86_64 follow-up") and the status block.
+
+Owed back to the user (not a code change):
+
+6. **[git hygiene] Split the `pipeline_layer.rs` refactor** — the
+   `attn_str_to_format`/`ffn_str_to_format` → `from_registry_tag` dedup is a
+   sound single-source-of-truth cleanup but is **orthogonal to BitNet**
+   (BitNet never flows through `resolve_ffn_weights`). Land it as its own
+   "refactor: dedupe tag→format mapping" commit, not inside the feature.
+
+### Remaining — graduation to first-class (status 2026-06-20 after scoping)
+
+Close contact with the code (two scoping passes) revised this list: only G1
+was cleanly doable on the current machine. G2 and G4 hit genuine blockers and
+G3's framing was falsified. Detail per item:
+
+- **G1 — `QuantFormat` ternary variant + dispatch — ✅ DONE 2026-06-20.**
+  Added `QuantFormat::I2S` (+ `registry_tag`/`from_registry_tag` round-trip,
+  `is_ternary`), a dedicated `QuantMatVec::ternary_matvec` method (a
+  `BitLinearWeight` carries the per-channel scales the `&[u8]` `quant_matvec`
+  signature can't), and a `CpuBackend` impl on the best-available A8 kernel.
+  `quant_matvec` returns `None` for I2S (loud, like Q8_0); Metal panics (no
+  ternary shader). Registry-reachable now, not only by direct call. Tested +
+  clippy-clean.
+- **G2 — `KvEngine` impl + shared cache — BLOCKED on a breaking trait change
+  (your call).** Scoping (kv_engine.rs / larql-kv) found `KvEngine::prefill`
+  and `decode_step` are typed `(&ModelWeights, &dyn FfnBackend, …)` — dense
+  f32 weights. `BitnetModel` holds ternary `BitLinearWeight`s, an incompatible
+  container. Making BitNet a first-class `KvEngine` needs EITHER a
+  workspace-wide generalisation of the weight parameter to a `dyn` trait (real
+  breaking change, hot-path dyn dispatch — heavy for an example-only feature)
+  OR a type-lie (accept `&ModelWeights`, ignore it, route to an owned
+  `BitnetModel`) — rejected as exactly the parallel-path anti-pattern the
+  policy box forbids. The cache-only sub-part (`BitnetKvCache` →
+  `larql-kv::KvCache`) is shape-compatible but marginal (the shared cache
+  doesn't append-in-place for this path either) and carries hot-path parity
+  risk, and it does NOT reach "first-class". → Decision: take the breaking
+  trait generalisation, or leave BitNet isolated-but-explicit (recommended
+  until a second consumer exists).
+- **G3 — vindex quant-tag unification — GOAL FALSIFIED; struck.** Scoping
+  found BitNet vindexes are **mixed**: the dense scaffold (`embed`, `lm_head`,
+  `output_norm`) is f32 and loaded by the standard loader with
+  `skip_attn`/`skip_ffn`, while only attn/ffn are ternary. `quant:
+  QuantFormat::None` is therefore *correct* for the dense loader — setting
+  `quant: I2S` would mislead it into decoding the embedding as ternary. A
+  single `quant` tag cannot represent a mixed model; the two-field design
+  (`quant` for the dense scaffold + `bitnet_layout` manifest for the ternary
+  tensors) is the right shape. The only survivor is a modest mechanical
+  cleanup — move `bitnet_writer` from a `convert_cmd` read-modify-write
+  post-patch into the build pipeline so `index.json` is written once — low
+  payoff, invasive through the shared build path. Not pursued.
+- **G4 — AVX2 `_mm256_sign_epi8` twin — BLOCKED on an x86 build/test box.**
+  Design is clear (decode trit codes → a `{-1,0,+1}` int8 control, one
+  `_mm256_sign_epi8(x, control)`, widen-accumulate; bit-identical to scalar).
+  But this aarch64 machine can neither runtime-validate the SIMD NOR even
+  compile-check it (cross-`check` fails in the C-FFI build script — no
+  `x86_64-linux-gnu-gcc`). Committing unbuilt, unvalidated intrinsics violates
+  the parity discipline. → Defer to an x86 dev box / Linux CI runner, where
+  the scalar-vs-AVX2 bit-exact test (already the pattern for the NEON twin)
+  can gate it. x86_64 keeps the correct scalar-A8 path (~2.4×) meanwhile.
+
+### Productization plan (decision: PRODUCTIZE, 2026-06-20)
+
+Direction chosen: make BitNet a real served path, not a validated experiment.
+Scoping fixed the magnitude — BitNet has **zero CLI/server hookup today**
+(`load_bitnet_model` is called only from the example); the dense run path is
+`layer_graph::generate_streaming` over the engine dispatch; `run_cmd::run()`
+is a chain of early-return mode branches (experts / ffn / moe / image). Three
+stages, smallest-blast first:
+
+- **P-A — Serve BitNet from `larql run` (CLI) — ✅ BEHAVIOUR-VERIFIED
+  2026-06-20.** `run_cmd::run()` branches on `config.bitnet_layout.is_some()`
+  and drives `ternary::generate_streaming_bitnet` (greedy stream + chat REPL),
+  bypassing the dense `walk_cmd` path. Smoke-tested against
+  `~/larql-vindex/bitnet-2b.vindex`:
+  `larql run <vindex> "The capital of France is" -n 16` →
+  `" Paris. Paris is a city that is known for its rich history, culture,"` —
+  deterministic across runs. **This greedy output is the P-B regression
+  oracle** (saved local-only at `bench/oracles/bitnet_2b_capital_of_france.txt`;
+  not committed — depends on the >1 GB vindex; repro = the command above).
+  Bridges at the run layer; does NOT make BitNet a `KvEngine`.
+  *Remaining (deferred to AFTER P-B, deliberately): server stream-route wiring
+  + chat-template/sampling parity — wiring the server now would thread
+  `&ModelWeights` through the hot path B1 is about to strip; wire once, after.*
+- **P-B — First-class `KvEngine` (the structural refactor).** Blast radius
+  measured: **8 production engine impls + ~171 `prefill`/`decode_step` call
+  sites + `EngineKind`/`AnyEngine`**. The one-way-door is the trait shape;
+  pick before the breaking change:
+  - **B1 (CHOSEN 2026-06-20): engines own their weights.** Move `&ModelWeights`
+    out of `prefill`/`decode_step` into engine construction (engines hold
+    `Arc<ModelWeights>`); `BitnetEngine` holds `Arc<BitnetModel>`.
+    **Read-only check (done):** dense `prefill`/`decode_step` and the
+    `*_resident` path take `&ModelWeights` (read-only — B1-clean); BitNet
+    weights are final (no mutation). BUT the **quant-resident path
+    (`prefill_quant`/`decode_step_quant`) takes `&mut ModelWeights`** — it
+    memoizes resident-quant buffers back into the struct. So B1 is NOT pure
+    mechanical churn; it bundles one design sub-decision for that path:
+    **(a)** relocate the resident-quant memoization out of `ModelWeights` into
+    engine-owned derivative state (recommended — lands on the StatePolicy
+    split: canonical weights immutable, derived caches are engine state), or
+    **(b)** `Arc<ModelWeights>` + interior mutability (`OnceCell`/`RwLock`) on
+    just the resident-quant fields (smaller, keeps derived state in the
+    canonical struct). Cost = ~171 mechanical sites + this sub-decision.
+  - **B2: `&dyn ModelSource` param.** New trait; `&ModelWeights` auto-coerces
+    so most call sites are untouched, but the trait must mirror the slice of
+    `ModelWeights` engines use, and BitNet panics on dense-only methods.
+  - **B3: `ModelWeights` gains a ternary representation.** Smallest type diff
+    but leaks ternary-awareness into the dense engines — rejected.
+  Do P-B as its own PR after P-A proves the path; hold parity per the 7-spec
+  `resident_identity_tests` discipline.
+
+  **Grounded execution stages (B1a chosen, real-code scope 2026-06-20).** The
+  `&mut` has a single chokepoint:
+  `larql_inference::vindex::dequant::ensure_attn_tensors_dequantised(&mut weights, index)`
+  (`vindex/dequant.rs:35`) — it dequantises Q4K Q/K/V/O into `weights.tensors`
+  (a `HashMap`) keyed by `arch.attn_{q,k,v,o}_key(layer)`, idempotent, and the
+  forward reads them back from that map. Pure derivative state. Stages, each
+  compilable + checked against the captured greedy oracle:
+  - **P-B.1 — relocate the dequant cache (HOME LOCKED: engine, not
+    `ModelWeights`; concurrency evidence 2026-06-20).** Move the dequantised-
+    attention `HashMap` out of `weights.tensors` into **engine-owned** state and
+    consult it at the forward's tensor-read sites (resolver: engine cache →
+    canonical weights). Drops the `&mut` from `prefill_quant`/`decode_step_quant`.
+    *Why engine, not an interior-mutable `RwLock` field on `ModelWeights`:* the
+    scratch is **transient** (per-layer evicted for the memory bound) → per-
+    forward state, not a persistent cache. The server holds one
+    `weights: OnceLock<RwLock<ModelWeights>>` and **serializes every generation
+    behind an exclusive write lock** (`state.rs:186 lock_weights_for_gen`,
+    used by all OpenAI gen routes) *specifically because* this dequant mutation
+    makes weights non-immutable ("concurrent reads block while a generation is
+    in flight"). An interior-mut `RwLock` field can't lift that — two forwards
+    sharing one `Arc` would clobber each other's evicting scratch, so gen would
+    still have to serialize (and the dense 117 tok/s path would pay a per-resolve
+    read-lock + `ArcArray` clone for a scratch that's always empty for it).
+    Engine-owned scratch makes `ModelWeights` **truly immutable** →
+    `Arc<ModelWeights>` shared across **concurrent** generations, each engine
+    its own cache (no lock, no race, no tax) — the actual payoff of the refactor.
+    Resolver threads as `&mut self.dequant_cache` from the engine (it's already
+    the `&mut self` forward context). Touches the Q4K residency path —
+    `resident_identity_tests` + the oracle guard it. *(A provisional
+    `RwLock`-in-`ModelWeights` impl was tried this session and reverted on this
+    evidence before the read-site/trait sweep could cement it.)*
+
+    **P-B.1 status (2026-06-20): signature stages DONE+committed, relocation
+    set up + reverted-to-green.** Done behavior-identical: `WeightsView`/
+    `DequantScratch` foundation; **Stage 1** (`run_attention_with_kv_backend` →
+    `WeightsView`, ~22 `dense()` wraps); **Stage 2a** (`dense_ffn_forward` →
+    `WeightsView`, `WeightFfn`/`BackendFfn` wrap `dense()` internally so the 326
+    `WeightFfn` construction sites stay untouched). The workspace-spanning
+    cross-crate signature diff is banked, decoupled from any behavior change,
+    each proven byte-identical by parity tests.
+
+    **Stage 2b (the relocation, behavior-changing) was reverted, and the reason
+    is categorical, not cost.** The first four blast-radius escalations
+    (RwLock→engine, cross-crate, 326-`WeightFfn`, decode reader) were all
+    *compiler-visible*: change a signature, the compiler enumerates callers. The
+    fifth is *type-system-invisible* — a reader that resolves `weights.tensors`
+    via `Deref` (canonical) while the scratch sits in an unconsulted
+    `DequantScratch` compiles clean, runs, and is wrong **only on the decode
+    path under a real Q4K vindex**. Holding that on a red tree across a session
+    boundary strands a miscompilation `cargo check` can't recover, so revert to
+    Stage 2a green was the only correctness-preserving move.
+
+    **Silent-break closure = make the miss LOUD, not enumerate readers.** The
+    grep inventory (`tensors.get(&arch.attn_*/ffn_*`) is *current, not complete*
+    — blind to precomputed-key reads, prefix iteration, accessor methods that
+    `.get` internally. The design fix: for a quant model those dequant keys were
+    **never** in canonical `tensors` (they only ever existed as the forward-time
+    mutation target being relocated), so if the relocation inserts only into
+    scratch and leaves canonical untouched, a missed reader resolves `None` →
+    the existing `.unwrap_or_else(panic)` / `?`-bail fires on first decode, on
+    any vindex. **Design property to enforce: leave canonical genuinely empty of
+    dequant keys (not shadowed)** → misses are loud by construction. Grep scopes
+    the conversion; the runtime catches its misses.
+
+    **Stage 2b entry conditions (all met — no upstream gap this time):**
+    (1) a Q4K vindex — **`~/larql-vindex/qwen3-0.6b-q4k.vindex` exists**;
+    (2) a **multi-token DECODE** oracle captured at Stage 2a (NOT prefill-only /
+    single-token — the decode reader is exactly the one Stage 1 missed, so a
+    prefill-heavy capture has a blind spot the shape of the bug); byte-identical
+    decode vs Stage 2a is the regression spine; (3) the canonical-empty shaping
+    above. With these, the reader conversion is mechanical and the silent-break
+    class is closed by construction.
+
+    **Stage 2b progress + the reader-family finding (2026-06-20).** Done +
+    committed behavior-identical: all THREE "primary" quant-path readers now
+    take `WeightsView` — `run_attention_with_kv_backend` (Stage 1),
+    `dense_ffn_forward` (Stage 2a), `run_attention_block_decode_step_backend`
+    (Stage 2b-pre). The Q4K **decode** oracle is captured
+    (`bench/oracles/q4k_qwen3_history_of_computing.txt`, 24-token greedy on
+    `qwen3-0.6b-q4k.vindex`). The relocation proper (inserters→scratch,
+    `ViewFfn`, wire the cached prefill+decode loops, drop `&mut`) was drafted
+    and reverted to green when the **secondary** loops (`hidden.rs`,
+    `interventions.rs`) surfaced that the reader set is *still* expanding on
+    contact: they reach attention through `run_layer_with_ffn` →
+    `run_attention_inner` / `run_attention_with_kv_cache` →
+    `run_attention_block_core` (block.rs) + `run_attention_block_gpu` (gpu.rs)
+    — **un-converted readers the grep never surfaced**, exactly the
+    "current-not-complete" inventory. So the true relocation scope is "convert
+    the **whole attention-reader family**" (with_kv_backend✓ / decode✓ /
+    block_core / block_gpu / inner / with_kv_cache), each a Stage-1-style
+    cascade through a widely-used fn — several more passes, not one. The cached
+    decode path (the oracle path) wired cleanly; the secondary loops need the
+    rest of the family first. **Loud-break makes this safe to do incrementally**
+    (canonical empty of dequant keys → a missed reader gets `None` → the
+    existing `.unwrap_or_else(panic)` fires on first decode, loud not silent),
+    so each remaining reader can be converted + the loop wired + validated
+    against the oracle without a silent miscompilation risk.
+
+    **✅ DONE (2026-06-20, `9650582e` + `f0da87cc`).** The whole-family
+    conversion + the relocation both landed. (1) `9650582e` converted the
+    entire attention-reader family to `WeightsView` — `block_core`, `block_gpu`,
+    `run_attention_inner`, `run_attention_with_kv_cache`, `run_layer_with_ffn`,
+    `run_layer_with_capture[_hooked]`, `run_attention_public` + the block.rs
+    family — ~100 callers `dense()`-wrapped across compute/inference/kv/cli/
+    server/examples, behavior-identical (the compiler enumerated the family for
+    me; the cascade bottoming out *is* the proof the inventory is now complete).
+    (2) `f0da87cc` did the relocation: the production decode path
+    (`predict_kquant_prefill/decode_step` + `hidden` + `interventions`)
+    dequantises into a forward-local `DequantScratch` resolved via
+    `WeightsView::with_scratch` + `ViewFfn` — **`weights` is `&ModelWeights`
+    (immutable, Arc-able) on the decode path, `&mut` dropped.** Bulk
+    f32-fallback + dev drivers (KvEngine `*_quant` trait defaults, all larql-kv
+    quant-engine overrides, apollo, ov_rd CLI, the lql relation resolver, the
+    vision/image CLI, examples) keep in-`weights` behaviour via `*_resident`
+    shims (dequant → scratch → merge into `weights.tensors`). Validated:
+    workspace `--all-targets` green, clippy 0 warnings, 50 kquant + 13 dequant +
+    resident_identity tests pass, decode **byte-identical to the oracle** both
+    after the family conversion and after the relocation. **Follow-up:** the
+    `*_resident` bulk path is still `&mut` — dropping it needs engine-owned
+    scratch state (folds into P-B.2/P-B.3, not a blocker); loud-break guards it.
+
+    **P-B.1b — "no shims" full sweep (scoped 2026-06-20; WIP stashed).** Going
+    for zero `weights.tensors.extend` shims surfaced a **second `kquant_forward`
+    implementation**: the production `larql run` decode dispatches via KvEngines
+    → `coarse_prefill` → **larql-compute's** `kquant_forward` (1005 lines), NOT
+    the larql-inference copy (1772 lines) that P-B.1 relocated. The
+    larql-inference copy serves the direct-`predict_kquant`/AVE/hidden paths and
+    is validated by the 50 kquant unit tests; **the e2e oracle actually
+    exercises larql-compute's copy** (so the family conversion — shared
+    `run_attention_*` — was oracle-validated, but the larql-inference relocation
+    was unit-test-validated, not oracle). The full no-shim change is large and
+    interconnected:
+    (1) relocate **larql-compute's** `kquant_forward` too (cached/decode loops →
+        forward-local scratch + `ViewFfn`) — DONE in the stash, the real oracle
+        path now no-shim;
+    (2) `KvDispatch` (5 methods) + the 7 dispatch helpers + `AsyncComputeBackend`
+        + cpu/metal impls → `WeightsView` — DONE in the stash;
+    (3) coarse path (`coarse_prefill`/`coarse_decode_step`) drops `&mut` (delegates
+        to the now-`&` `predict_kquant_*`) — DONE;
+    (4) `KvEngine`/`RetrievalEngine` trait quant methods → `&ModelWeights`;
+        `RetrievalEngine::prefill_quant` default → loud error (apollo overrides;
+        the `ffn`-less `prefill` can't thread a scratch) — DONE;
+    (5) **engine-scratch design** (validated on `StandardEngine`): each engine
+        owns a `dequant_scratch: DequantScratch`; `do_prefill`/`do_decode_step`
+        build `WeightsView::with_scratch(weights, &self.dequant_scratch)` — the
+        view borrows `self.dequant_scratch` while `self.handles`/`self.backend`
+        are borrowed disjointly, so **no take/restore dance**; `prefill_quant`
+        dequants into the field, no merge. StandardEngine compiles clean.
+    Remaining (the stash is mid-sweep, ~29 errors): the **other 7 engines**
+    (no_cache, boundary×2, markov×2, turbo, unlimited, apollo) each need the
+    same field + view-thread + `&mut`-drop, plus their forward helpers
+    (`kv_prefill_run` + the `generate_cached_*` loops in larql-kv/generation.rs,
+    apollo's `forward_raw_logits`) converted to `WeightsView`, then the dev
+    drivers (ov_rd/lql/vision/examples) + delete the `*_resident` shims. The
+    pattern is mechanical but keeps surfacing forward helpers on contact (the
+    reader-family expansion, now in the engine layer) — a focused dedicated pass.
+    `git stash list` → "no-shims WIP".
+
+    **Convergence measurement (2026-06-21).** Resumed the sweep and pushed into
+    the engines. Additional shared decode/recompute readers converted to
+    `WeightsView` (these are real foundation, beyond the StandardEngine work):
+    `run_attention_block_decode_step_auto` + `_auto_inplace` (the resident-decode
+    switcher used by **5 engines** — q4k-direct branch reads native index bytes
+    via `.canonical()`, f32 branch threads the view), `kv_prefill_run`
+    (no_cache + standard), `recompute_kv` + `attn_kv_projection_weights`
+    (boundary + markov), and **NoCacheEngine** fully (field + view-thread +
+    `&mut` drop, clean). **But the larql-kv error count DIVERGED as I converted:
+    28 → 45 → 67.** Each engine's `walk.rs`/`compute.rs` forward module is a deep
+    chain (engine → walk → recompute → projection → `weights.tensors`), and
+    converting one helper exposes its callers + their internal reads. This is the
+    reader-family expansion at its widest — **converting every engine's full
+    forward/recompute internals** (~30-50+ functions across 6 engine modules +
+    apollo's `forward_raw_logits` + the dev drivers). The diverging count is the
+    decision signal: this is a **staged multi-session refactor**, best done one
+    engine module at a time (convert its walk+compute internals, validate that
+    engine against a per-engine oracle, commit), not a single grind. The shared
+    helpers above are the foundation already laid; the per-engine internals are
+    the remaining bulk. WIP re-stashed.
+
+    **✅ DONE (2026-06-21, `379885ed`).** The diverging count (28→45→67)
+    **converged to 0** as each engine module got the same template — the
+    "diverging" was the compiler enumerating the work, not the work being
+    unbounded. Every KvEngine (standard, no_cache, markov_residual,
+    markov_residual_codec, boundary_per_layer, boundary_kv, turbo_quant,
+    unlimited_context, apollo) now owns a `dequant_scratch` field; quant methods
+    dequant into it and the forward resolves through `WeightsView::with_scratch`
+    — **0 `&mut ModelWeights` quant methods, 0 `weights.tensors.extend` merges on
+    the engine/serving path.** Per-engine pattern: bulk-convert the engine's
+    `walk.rs`/`compute.rs`/`executor.rs`/`cold_tier.rs`/`dispatch.rs` to
+    `WeightsView` (canonical reads — `embed`/`run_ffn`/`layer_ffn_or_moe`/
+    `BackendFfn`/`WalkFfn`/native-q4k — via `.canonical()`/`&weights`; attn reads
+    via the view), then the engine adds the field + threads `with_scratch` to its
+    forward calls + drops `&mut`. Also converted: `LayerExecutor` trait +
+    local_walk, `recompute_kv` + `attn_kv_projection_weights` (explicit lifetime),
+    `auto`/`auto_inplace` (5 engines), `kv_prefill_run`, `forward_raw_logits`/
+    `forward_from_layer` + raw.rs internals (`ViewFfn`; `hidden_to_raw_logits`/
+    `apply_logits_transform` stay `&ModelWeights` = lm_head canonical). The
+    `*_resident` helpers (`ensure_attn_..._resident` etc.) deliberately **remain**
+    for ~58 dev/research call sites (ov_rd CLI, lql resolver, vision CLI,
+    examples) that own a `&mut ModelWeights` and run one-off forwards against
+    canonical `weights.tensors` — a documented separate API, not serving-path
+    shims. Validated: workspace `--all-targets` green, clippy 0, **766 larql-kv +
+    40 kquant + resident_identity + 4 dispatch_parity (cross-engine bit-parity)**
+    tests pass, decode **byte-identical to the oracle**, and
+    markov-rs/unlimited/turbo-quant/no-cache smoke-tested coherent at runtime.
+    **Engine/serving path is now fully `&ModelWeights` — P-B.2 (Arc-owned) is
+    unblocked with no remaining `&mut` to chase in the engines.**
+  - **P-B.2 — Arc-owned weights.** Every weight param is now `&ModelWeights`;
+    move it into engine construction (engines hold `Arc<ModelWeights>`) and drop
+    the param from prefill/decode/quant/resident/executor variants. ~171 call
+    sites (all production, 0 in test files) + `EngineKind`/`AnyEngine`.
+    Compiler-driven — the safe kind of large churn.
+  - **P-B.3 — `BitnetEngine` + dispatch.** New engine holding
+    `Arc<BitnetModel>`, `impl KvEngine` over the ternary forward; add the
+    `EngineKind`/`AnyEngine` arm so unified dispatch picks ternary vs dense.
+  - **P-B.4 — validate** against the oracle (greedy "Paris…" byte-identical) +
+    the engine parity suite.
+  Best run in an isolated worktree so `main` stays stable through the change.
+- **P-C — G4 AVX2 + x86 CI.** Add a Linux-x86 CI job; land the AVX2 twin gated
+  by the scalar-vs-AVX2 bit-exact test (the NEON-twin pattern). Independent of
+  P-A/P-B; unblocks G4's environment blocker.
 
 ---
 
