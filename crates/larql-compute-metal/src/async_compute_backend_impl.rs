@@ -68,8 +68,7 @@ impl AsyncComputeBackend for MetalBackend {
         window: Option<usize>,
         index: Option<&dyn larql_compute::KvIndex>,
     ) -> (AttentionHandle, KvHandle) {
-        CPU.attention_prefill_async(
-weights, tokens_embedded, layer, window, index)
+        CPU.attention_prefill_async(weights, tokens_embedded, layer, window, index)
     }
 
     fn upload_boundary_residual_async(
@@ -128,12 +127,23 @@ mod tests {
         let tokens = vec![0u32, 1, 2];
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
         let (_h_prefill, mut kv) = m.attention_prefill_async(
-larql_models::WeightsView::dense(&weights), &h_in, 0, None, None);
+            larql_models::WeightsView::dense(&weights),
+            &h_in,
+            0,
+            None,
+            None,
+        );
         let h_new = larql_compute::forward::embed_tokens_pub(&weights, &[3u32]);
         let abs_position = tokens.len();
         let h_async = m
             .attention_step_async(
-larql_models::WeightsView::dense(&weights), &h_new, &mut kv, 0, abs_position, None)
+                larql_models::WeightsView::dense(&weights),
+                &h_new,
+                &mut kv,
+                0,
+                abs_position,
+                None,
+            )
             .read();
         assert_eq!(h_async.ncols(), weights.hidden_size);
         assert_eq!(h_async.nrows(), 1);
@@ -146,11 +156,16 @@ larql_models::WeightsView::dense(&weights), &h_new, &mut kv, 0, abs_position, No
         let tokens = vec![0u32, 1, 2];
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
         let (_, mut kv) = m.attention_prefill_async(
-larql_models::WeightsView::dense(&weights), &h_in, 0, None, None);
+            larql_models::WeightsView::dense(&weights),
+            &h_in,
+            0,
+            None,
+            None,
+        );
         let h_new = larql_compute::forward::embed_tokens_pub(&weights, &[3u32]);
         let h_async = m
             .attention_step_windowed_async(
-larql_models::WeightsView::dense(&weights),
+                larql_models::WeightsView::dense(&weights),
                 &h_new,
                 &mut kv,
                 0,
@@ -169,7 +184,12 @@ larql_models::WeightsView::dense(&weights),
         let tokens = vec![0u32, 1, 2];
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
         let (h_handle, kv) = m.attention_prefill_async(
-larql_models::WeightsView::dense(&weights), &h_in, 0, None, None);
+            larql_models::WeightsView::dense(&weights),
+            &h_in,
+            0,
+            None,
+            None,
+        );
         let h = h_handle.read();
         assert_eq!(h.nrows(), tokens.len());
         assert_eq!(h.ncols(), weights.hidden_size);
@@ -210,11 +230,21 @@ larql_models::WeightsView::dense(&weights), &h_in, 0, None, None);
         let (_, residuals_c) = cpu.upload_boundary_residual_async(&residual);
         let h_m = m
             .forward_from_layer_async(
-larql_models::WeightsView::dense(&weights), &ffn, 1, &residuals_m, &tokens)
+                larql_models::WeightsView::dense(&weights),
+                &ffn,
+                1,
+                &residuals_m,
+                &tokens,
+            )
             .read();
         let h_c = cpu
             .forward_from_layer_async(
-larql_models::WeightsView::dense(&weights), &ffn, 1, &residuals_c, &tokens)
+                larql_models::WeightsView::dense(&weights),
+                &ffn,
+                1,
+                &residuals_c,
+                &tokens,
+            )
             .read();
         assert_eq!(h_m, h_c, "Metal delegation must bit-match CpuBackend");
     }

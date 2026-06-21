@@ -59,8 +59,7 @@ impl KvDispatch for MetalBackend {
     ) -> Option<Array2<f32>> {
         // A3 scaffold delegates to CPU. A4/A6 will introduce a Q4K-native
         // Metal path when `index` is `Some` and Q4K data is available.
-        CPU.attention_step(
-weights, query, kv, layer, abs_position, index)
+        CPU.attention_step(weights, query, kv, layer, abs_position, index)
     }
 
     fn attention_step_windowed(
@@ -73,8 +72,7 @@ weights, query, kv, layer, abs_position, index)
         window: usize,
         index: Option<&dyn larql_compute::KvIndex>,
     ) -> Option<Array2<f32>> {
-        CPU.attention_step_windowed(
-weights, query, kv, layer, abs_position, window, index)
+        CPU.attention_step_windowed(weights, query, kv, layer, abs_position, window, index)
     }
 
     fn attention_prefill(
@@ -85,8 +83,7 @@ weights, query, kv, layer, abs_position, window, index)
         window: Option<usize>,
         index: Option<&dyn larql_compute::KvIndex>,
     ) -> Option<(Array2<f32>, KvHandle)> {
-        CPU.attention_prefill(
-weights, tokens_embedded, layer, window, index)
+        CPU.attention_prefill(weights, tokens_embedded, layer, window, index)
     }
 
     fn recompute_kv_from_residuals(
@@ -121,8 +118,7 @@ weights, tokens_embedded, layer, window, index)
         residuals: &ResidualHandle,
         token_ids: &[u32],
     ) -> Option<Array2<f32>> {
-        CPU.forward_from_layer(
-weights, start_layer, residuals, token_ids)
+        CPU.forward_from_layer(weights, start_layer, residuals, token_ids)
     }
 
     fn residual_norm_store(
@@ -172,8 +168,7 @@ weights, start_layer, residuals, token_ids)
     ) -> Option<(Array2<f32>, KvHandle)> {
         let index = index?;
         let Some(state) = state else {
-            return self.coarse_prefill(
-weights, token_ids, Some(index));
+            return self.coarse_prefill(weights, token_ids, Some(index));
         };
         if token_ids.is_empty() {
             return None;
@@ -529,12 +524,23 @@ mod tests {
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
         let (_, mut kv) = m
             .attention_prefill(
-larql_models::WeightsView::dense(&weights), &h_in, 0, None, None)
+                larql_models::WeightsView::dense(&weights),
+                &h_in,
+                0,
+                None,
+                None,
+            )
             .expect("prefill");
         let h_new = larql_compute::forward::embed_tokens_pub(&weights, &[3u32]);
         let h = m
             .attention_step(
-larql_models::WeightsView::dense(&weights), &h_new, &mut kv, 0, tokens.len(), None)
+                larql_models::WeightsView::dense(&weights),
+                &h_new,
+                &mut kv,
+                0,
+                tokens.len(),
+                None,
+            )
             .expect("attention_step");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -547,12 +553,24 @@ larql_models::WeightsView::dense(&weights), &h_new, &mut kv, 0, tokens.len(), No
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
         let (_, mut kv) = m
             .attention_prefill(
-larql_models::WeightsView::dense(&weights), &h_in, 0, None, None)
+                larql_models::WeightsView::dense(&weights),
+                &h_in,
+                0,
+                None,
+                None,
+            )
             .expect("prefill");
         let h_new = larql_compute::forward::embed_tokens_pub(&weights, &[3u32]);
         let h = m
             .attention_step_windowed(
-larql_models::WeightsView::dense(&weights), &h_new, &mut kv, 0, tokens.len(), 64, None)
+                larql_models::WeightsView::dense(&weights),
+                &h_new,
+                &mut kv,
+                0,
+                tokens.len(),
+                64,
+                None,
+            )
             .expect("windowed attention_step");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -565,7 +583,12 @@ larql_models::WeightsView::dense(&weights), &h_new, &mut kv, 0, tokens.len(), 64
         let h_in = larql_compute::forward::embed_tokens_pub(&weights, &tokens);
         let (h, kv) = m
             .attention_prefill(
-larql_models::WeightsView::dense(&weights), &h_in, 0, None, None)
+                larql_models::WeightsView::dense(&weights),
+                &h_in,
+                0,
+                None,
+                None,
+            )
             .expect("prefill");
         assert_eq!(h.shape(), &[tokens.len(), weights.hidden_size]);
         assert_eq!(kv.cached_len(), tokens.len());
@@ -585,9 +608,15 @@ larql_models::WeightsView::dense(&weights), &h_in, 0, None, None)
             Array2::from_shape_vec((3, weights.hidden_size), vec![0.0; 3 * weights.hidden_size])
                 .unwrap();
         let m_result = m.recompute_kv_from_residuals(
-larql_models::WeightsView::dense(&weights), &residuals, 0);
+            larql_models::WeightsView::dense(&weights),
+            &residuals,
+            0,
+        );
         let cpu_result = cpu.recompute_kv_from_residuals(
-larql_models::WeightsView::dense(&weights), &residuals, 0);
+            larql_models::WeightsView::dense(&weights),
+            &residuals,
+            0,
+        );
         assert_eq!(
             m_result.is_some(),
             cpu_result.is_some(),
@@ -615,7 +644,12 @@ larql_models::WeightsView::dense(&weights), &residuals, 0);
                 .unwrap();
         let handle = m.upload_boundary_residual(&residual).expect("upload");
         let h = m
-            .forward_from_layer(larql_models::WeightsView::dense(&weights), 1, &handle, &[0u32, 1, 2])
+            .forward_from_layer(
+                larql_models::WeightsView::dense(&weights),
+                1,
+                &handle,
+                &[0u32, 1, 2],
+            )
             .expect("forward_from_layer");
         assert_eq!(h.ncols(), weights.hidden_size);
     }
