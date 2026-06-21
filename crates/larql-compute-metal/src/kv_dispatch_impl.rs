@@ -689,10 +689,10 @@ mod tests {
 
     #[test]
     fn coarse_decode_step_without_index_returns_none() {
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let m = backend();
         let mut handle = KvHandle::new(MetalCoarseHandle);
-        let result = m.coarse_decode_step(&mut weights, 0u32, None, &mut handle, 0);
+        let result = m.coarse_decode_step(&weights, 0u32, None, &mut handle, 0);
         assert!(result.is_none());
     }
 
@@ -705,9 +705,9 @@ mod tests {
         use larql_compute::test_fixtures::make_q4k_fixture_index;
         use larql_models::test_fixtures::make_test_q4k_weights;
         let m = backend();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let idx = make_q4k_fixture_index(&weights);
-        let result = m.coarse_prefill(&mut weights, &[0u32, 1, 2], Some(&idx));
+        let result = m.coarse_prefill(&weights, &[0u32, 1, 2], Some(&idx));
         let (h, _handle) = result.expect("Metal Q4K prefill succeeds");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -718,11 +718,11 @@ mod tests {
         use larql_compute::test_fixtures::make_q4k_fixture_index;
         use larql_models::test_fixtures::make_test_q4k_weights;
         let m = backend();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let idx = make_q4k_fixture_index(&weights);
         let mut state = larql_compute::PerLayerDecodeState::with_capacity(weights.num_layers);
         let result =
-            m.coarse_prefill_with_state(&mut weights, &[0u32, 1, 2], Some(&idx), Some(&mut state));
+            m.coarse_prefill_with_state(&weights, &[0u32, 1, 2], Some(&idx), Some(&mut state));
         let (h, _handle) = result.expect("Metal Q4K prefill-with-state succeeds");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
         assert!(state.is_complete_for(weights.num_layers));
@@ -734,13 +734,13 @@ mod tests {
         use larql_compute::test_fixtures::make_q4k_fixture_index;
         use larql_models::test_fixtures::make_test_q4k_weights;
         let m = backend();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let idx = make_q4k_fixture_index(&weights);
         // Seed the KV cache via prefill.
         let (_h, mut handle) = m
-            .coarse_prefill(&mut weights, &[0u32, 1, 2], Some(&idx))
+            .coarse_prefill(&weights, &[0u32, 1, 2], Some(&idx))
             .expect("prefill seeds the cache");
-        let result = m.coarse_decode_step(&mut weights, 4u32, Some(&idx), &mut handle, 3);
+        let result = m.coarse_decode_step(&weights, 4u32, Some(&idx), &mut handle, 3);
         let h = result.expect("Metal Q4K decode step returns Some");
         assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
@@ -753,10 +753,10 @@ mod tests {
         use larql_compute::test_fixtures::make_q4k_fixture_index;
         use larql_models::test_fixtures::make_test_q4k_weights;
         let m = backend();
-        let mut weights = make_test_q4k_weights();
+        let weights = make_test_q4k_weights();
         let idx = make_q4k_fixture_index(&weights);
         let (_h, mut handle) = m
-            .coarse_prefill(&mut weights, &[0u32, 1, 2], Some(&idx))
+            .coarse_prefill(&weights, &[0u32, 1, 2], Some(&idx))
             .expect("prefill seeds the cache");
         for mask in [
             larql_compute::StateDumpMask::Full,
@@ -765,7 +765,7 @@ mod tests {
         ] {
             let mut state = larql_compute::PerLayerDecodeState::with_capacity(weights.num_layers);
             let result = m.coarse_decode_step_with_state_masked(
-                &mut weights,
+                &weights,
                 5u32,
                 Some(&idx),
                 &mut handle,
@@ -782,11 +782,11 @@ mod tests {
 
     #[test]
     fn coarse_decode_step_with_state_masked_without_index_returns_none() {
-        let mut weights = make_test_weights();
+        let weights = make_test_weights();
         let m = backend();
         let mut handle = KvHandle::new(MetalCoarseHandle);
         let result = m.coarse_decode_step_with_state_masked(
-            &mut weights,
+            &weights,
             0u32,
             None,
             &mut handle,
