@@ -976,6 +976,35 @@ stages, smallest-blast first:
     engine against a per-engine oracle, commit), not a single grind. The shared
     helpers above are the foundation already laid; the per-engine internals are
     the remaining bulk. WIP re-stashed.
+
+    **✅ DONE (2026-06-21, `379885ed`).** The diverging count (28→45→67)
+    **converged to 0** as each engine module got the same template — the
+    "diverging" was the compiler enumerating the work, not the work being
+    unbounded. Every KvEngine (standard, no_cache, markov_residual,
+    markov_residual_codec, boundary_per_layer, boundary_kv, turbo_quant,
+    unlimited_context, apollo) now owns a `dequant_scratch` field; quant methods
+    dequant into it and the forward resolves through `WeightsView::with_scratch`
+    — **0 `&mut ModelWeights` quant methods, 0 `weights.tensors.extend` merges on
+    the engine/serving path.** Per-engine pattern: bulk-convert the engine's
+    `walk.rs`/`compute.rs`/`executor.rs`/`cold_tier.rs`/`dispatch.rs` to
+    `WeightsView` (canonical reads — `embed`/`run_ffn`/`layer_ffn_or_moe`/
+    `BackendFfn`/`WalkFfn`/native-q4k — via `.canonical()`/`&weights`; attn reads
+    via the view), then the engine adds the field + threads `with_scratch` to its
+    forward calls + drops `&mut`. Also converted: `LayerExecutor` trait +
+    local_walk, `recompute_kv` + `attn_kv_projection_weights` (explicit lifetime),
+    `auto`/`auto_inplace` (5 engines), `kv_prefill_run`, `forward_raw_logits`/
+    `forward_from_layer` + raw.rs internals (`ViewFfn`; `hidden_to_raw_logits`/
+    `apply_logits_transform` stay `&ModelWeights` = lm_head canonical). The
+    `*_resident` helpers (`ensure_attn_..._resident` etc.) deliberately **remain**
+    for ~58 dev/research call sites (ov_rd CLI, lql resolver, vision CLI,
+    examples) that own a `&mut ModelWeights` and run one-off forwards against
+    canonical `weights.tensors` — a documented separate API, not serving-path
+    shims. Validated: workspace `--all-targets` green, clippy 0, **766 larql-kv +
+    40 kquant + resident_identity + 4 dispatch_parity (cross-engine bit-parity)**
+    tests pass, decode **byte-identical to the oracle**, and
+    markov-rs/unlimited/turbo-quant/no-cache smoke-tested coherent at runtime.
+    **Engine/serving path is now fully `&ModelWeights` — P-B.2 (Arc-owned) is
+    unblocked with no remaining `&mut` to chase in the engines.**
   - **P-B.2 — Arc-owned weights.** Every weight param is now `&ModelWeights`;
     move it into engine construction (engines hold `Arc<ModelWeights>`) and drop
     the param from prefill/decode/quant/resident/executor variants. ~171 call
