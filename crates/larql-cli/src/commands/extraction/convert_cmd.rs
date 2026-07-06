@@ -532,11 +532,11 @@ fn run_gguf_to_vindex(
         } else {
             None
         }
-    });
+    }).or_else(|| reconstruct_tokenizer_from_gguf(&gguf.metadata).ok());
 
     let tokenizer_ref = tokenizer
         .as_ref()
-        .ok_or("tokenizer.json not found next to GGUF file. Place it in the same directory.")?;
+        .ok_or("tokenizer.json not found next to GGUF file, and GGUF metadata fallback failed.")?;
 
     // Compute model summary from GGUF metadata for the display line.
     // Avoids loading all tensors just for the summary.
@@ -798,4 +798,53 @@ fn patch_index_json_with_bitnet_layout(
     let json = serde_json::to_string_pretty(&config)?;
     std::fs::write(&path, json)?;
     Ok(())
+}
+
+fn reconstruct_tokenizer_from_gguf(
+    metadata: &std::collections::HashMap<String, larql_models::loading::gguf::GgufValue>,
+) -> Result<larql_vindex::tokenizers::Tokenizer, Box<dyn std::error::Error>> {
+    let tokens_val = metadata.get("tokenizer.ggml.tokens")
+        .ok_or("tokenizer.ggml.tokens not found in GGUF metadata")?;
+    
+    let tokens = match tokens_val {
+        larql_models::loading::gguf::GgufValue::Array(arr) => arr,
+        _ => return Err("tokenizer.ggml.tokens is not an array".into()),
+    };
+
+    let mut vocab = serde_json::Map::new();
+    for (i, val) in tokens.iter().enumerate() {
+        if let Some(s) = val.as_str() {
+            vocab.insert(s.to_string(), serde_json::Value::Number(serde_json::Number::from(i)));
+        }
+    }
+
+    // Default to a WordLevel tokenizer to satisfy the struct requirements.
+    // If we need merges for BPE, we extract them too.
+    let mut model = serde_json::json!({
+        "type": "WordLevel",
+        "vocab": vocab,
+    });
+
+    if let Some(larql_models::loading::gguf::GgufValue::Array(merges_arr)) = metadata.get("tokenizer.ggml.merges") {
+        let mut merges = Vec::new();
+        for val in merges_arr {
+            if let Some(s) = val.as_str() {
+                merges.push(s.to_string());
+            }
+        }
+        model = serde_json::json!({
+            "type": "BPE",
+            "vocab": vocab,
+            "merges": merges,
+        });
+    }
+
+    let tok_json = serde_json::json!({
+        "version": "1.0",
+        "model": model,
+    });
+
+    let tok_str = tok_json.to_string();
+    let tokenizer = tok_str.parse::<larql_vindex::tokenizers::Tokenizer>()?;
+    Ok(tokenizer)
 }

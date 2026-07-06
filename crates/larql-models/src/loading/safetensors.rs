@@ -50,14 +50,18 @@ pub fn is_ffn_tensor(key: &str) -> bool {
 /// tracks only the retained (attention / embed / lm_head / norms) weights.
 /// Use this with vindex-backed FFN (walk-only inference).
 pub fn load_model_dir_walk_only(path: impl AsRef<Path>) -> Result<ModelWeights, ModelError> {
-    load_model_dir_filtered(path, is_ffn_tensor)
+    load_model_dir_filtered(path, |k| is_ffn_tensor(k) || k.starts_with("visual."))
 }
 
 /// Validated variant of [`load_model_dir_walk_only`].
 pub fn load_model_dir_walk_only_validated(
     path: impl AsRef<Path>,
 ) -> Result<ModelWeights, ModelError> {
-    load_model_dir_filtered_with_validation(path, is_ffn_tensor, true)
+    load_model_dir_filtered_with_validation(
+        path,
+        |k| is_ffn_tensor(k) || k.starts_with("visual."),
+        true,
+    )
 }
 
 /// Load model weights from a directory or file.
@@ -69,7 +73,7 @@ pub fn load_model_dir_walk_only_validated(
 ///
 /// Detects architecture from config.json (safetensors) or GGUF metadata.
 pub fn load_model_dir(path: impl AsRef<Path>) -> Result<ModelWeights, ModelError> {
-    load_model_dir_filtered(path, |_| false)
+    load_model_dir_filtered(path, |k| k.starts_with("visual."))
 }
 
 /// Validated variant of [`load_model_dir`].
@@ -77,7 +81,7 @@ pub fn load_model_dir(path: impl AsRef<Path>) -> Result<ModelWeights, ModelError
 /// Architecture detection stays permissive in `load_model_dir`; use this when
 /// inference or extraction should fail fast on inconsistent config values.
 pub fn load_model_dir_validated(path: impl AsRef<Path>) -> Result<ModelWeights, ModelError> {
-    load_model_dir_filtered_with_validation(path, |_| false, true)
+    load_model_dir_filtered_with_validation(path, |k| k.starts_with("visual."), true)
 }
 
 /// Same as `load_model_dir` but `skip_key` returning true causes a tensor to
