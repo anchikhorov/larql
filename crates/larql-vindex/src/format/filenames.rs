@@ -41,6 +41,13 @@ pub const DOWN_FEATURES_BIN: &str = "down_features.bin";
 pub const UP_FEATURES_BIN: &str = "up_features.bin";
 pub const PLE_WEIGHTS_BIN: &str = "ple_weights.bin";
 
+// ── Packed MoE expert weights (Gemma 4 26B-A4B PackedBF16) ────────────
+//
+// Raw BF16 bytes for packed expert tensors `experts.gate_up_proj` and
+// `experts.down_proj` per layer, concatenated. Loaded via
+// `kind::PACKED_BF16` manifest entries into `packed_byte_ranges`.
+pub const EXPERTS_PACKED_BIN: &str = "experts_packed.bin";
+
 // ── Layer-major FFN weight files (PyTorch `nn.Linear` orientation) ────
 //
 // `[layer, intermediate, hidden]` for up and `[layer, hidden, intermediate]`

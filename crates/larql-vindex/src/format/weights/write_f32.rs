@@ -590,6 +590,60 @@ pub fn write_model_weights_with_opts(
         }
         up_file.flush()?;
         down_file.flush()?;
+
+        // ── Packed BF16 expert weights (Gemma 4 hybrid MoE) ──
+        //
+        // For architectures with `ExpertFormat::PackedBF16`, the per-expert
+        // loop above produces no entries (expert_ffn_*_key returns None).
+        // Instead, write the raw BF16 byte blobs from get_packed_bf16 into
+        // a single file and annotate the manifest so the loader records
+        // packed_byte_ranges for inference.
+        if arch.expert_format() == larql_models::ExpertFormat::PackedBF16 {
+            let experts_path = dir.join(EXPERTS_PACKED_BIN);
+            let mut experts_file = BufWriter::new(std::fs::File::create(&experts_path)?);
+            let mut experts_offset: u64 = 0;
+            let num_experts = arch.num_experts();
+            let moe_inter = arch.moe_intermediate_size();
+            let hidden = arch.config().hidden_size;
+
+            for layer in 0..num_layers {
+                callbacks.on_layer_start(COMP_UP_DOWN_WEIGHTS, layer, num_layers);
+
+                if let Some(gu_key) = arch.packed_experts_gate_up_key(layer) {
+                    if let Some(bytes) = source.get_packed_bf16(&gu_key) {
+                        let len = bytes.len() as u64;
+                        experts_file.write_all(&bytes)?;
+                        entries.push(WeightEntry {
+                            key: gu_key,
+                            kind: kind::PACKED_BF16.into(),
+                            shape: vec![num_experts, 2 * moe_inter, hidden],
+                            offset: experts_offset,
+                            length: len,
+                            file: EXPERTS_PACKED_BIN.into(),
+                        });
+                        experts_offset += len;
+                    }
+                }
+                if let Some(dn_key) = arch.packed_experts_down_key(layer) {
+                    if let Some(bytes) = source.get_packed_bf16(&dn_key) {
+                        let len = bytes.len() as u64;
+                        experts_file.write_all(&bytes)?;
+                        entries.push(WeightEntry {
+                            key: dn_key,
+                            kind: kind::PACKED_BF16.into(),
+                            shape: vec![num_experts, hidden, moe_inter],
+                            offset: experts_offset,
+                            length: len,
+                            file: EXPERTS_PACKED_BIN.into(),
+                        });
+                        experts_offset += len;
+                    }
+                }
+
+                callbacks.on_layer_done(COMP_UP_DOWN_WEIGHTS, layer, 0.0);
+            }
+            experts_file.flush()?;
+        }
     } // end if write_ffn
 
     // ── Norms ── (written whenever the level includes attention;

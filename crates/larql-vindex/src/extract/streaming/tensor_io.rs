@@ -430,8 +430,36 @@ impl<'a> WeightSource for GgufWeightSource<'a> {
         names
     }
 
-    fn get_packed_bf16(&self, _key: &str) -> Option<Vec<u8>> {
-        None // GGUF has no MXFP4-packed format
+    fn get_packed_bf16(&self, key: &str) -> Option<Vec<u8>> {
+        // Generic fallback: safetensors-backed weight source reads raw bytes
+        // from `ModelWeights.raw_bytes` (populated by the eager loader's
+        // `keep_raw_for_types` path).  This GGUF arm handles BF16 tensors
+        // (Gemma 4 packed experts) by extracting raw bytes from the mmap.
+        // MXFP4 (GPT-OSS) is not supported — GGUF doesn't store it.
+        if let Some(&info_idx) = self.src.index.get(key) {
+            let info = &self.src.gguf.tensor_infos[info_idx];
+            if info.tensor_type() != larql_models::quant::ggml::TYPE_BF16 {
+                return None;
+            }
+            let shard_idx = info.shard_idx();
+            let mmap = &self.src.shard_mmaps[shard_idx];
+            let data_offset = self.src.gguf.shards[shard_idx].data_offset;
+            let abs_offset = data_offset.checked_add(info.offset())?;
+            let n_elements: u64 = info.dims().iter().product();
+            let n_elements_usize = usize::try_from(n_elements).ok()?;
+            let data_size = larql_models::quant::ggml::tensor_data_size(
+                info.tensor_type(),
+                n_elements_usize,
+            )
+            .ok()?;
+            let abs_offset_usize = usize::try_from(abs_offset).ok()?;
+            let end = abs_offset_usize.checked_add(data_size)?;
+            if end > mmap.len() {
+                return None;
+            }
+            return Some(mmap[abs_offset_usize..end].to_vec());
+        }
+        None
     }
 }
 
