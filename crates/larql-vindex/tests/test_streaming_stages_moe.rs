@@ -28,8 +28,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use larql_vindex::{
-    build_vindex_streaming, ExtractLevel, KquantWriteOptions, QuantFormat, SilentBuildCallbacks,
-    StorageDtype, WriteWeightsOptions,
+    build_vindex, build_vindex_streaming, ExtractLevel, KquantWriteOptions, QuantFormat,
+    SilentBuildCallbacks, StorageDtype, WriteWeightsOptions,
 };
 
 /// Build a tiny Mixtral-shaped model (block-sparse MoE FFN with
@@ -1275,6 +1275,112 @@ fn streaming_extract_drop_gate_without_q4k_is_rejected() {
     );
 }
 
+/// Write a synthetic llama-architecture GGUF with all inference-level
+/// tensors (attention, FFN up, per-layer norms) and non-square FFN dims
+/// (hidden=4, intermediate=8).
+fn write_synthetic_llama_gguf_full(
+    path: &Path,
+    num_layers: usize,
+    vocab: usize,
+    hidden: u64,
+    intermediate: u64,
+) {
+    let v = vocab as u64;
+
+    let mut w = GgufWriter::new();
+    w.meta("general.architecture", GgufValue::String("llama".into()))
+        .meta("llama.embedding_length", GgufValue::U32(hidden as u32))
+        .meta("llama.block_count", GgufValue::U32(num_layers as u32))
+        .meta(
+            "llama.feed_forward_length",
+            GgufValue::U32(intermediate as u32),
+        )
+        .meta("llama.attention.head_count", GgufValue::U32(2))
+        .meta("llama.attention.head_count_kv", GgufValue::U32(2))
+        .meta("llama.attention.key_length", GgufValue::U32(2))
+        .meta("llama.rope.freq_base", GgufValue::F32(10000.0));
+
+    // Embeddings
+    w.tensor(GgufTensor {
+        name: "token_embd.weight".into(),
+        dims: vec![hidden, v],
+        ggml_type: 0,
+        data: gguf_f32_ramp((hidden * v) as usize),
+    });
+    w.tensor(GgufTensor {
+        name: "output.weight".into(),
+        dims: vec![hidden, v],
+        ggml_type: 0,
+        data: gguf_f32_ramp((hidden * v) as usize),
+    });
+    w.tensor(GgufTensor {
+        name: "output_norm.weight".into(),
+        dims: vec![hidden],
+        ggml_type: 0,
+        data: gguf_f32_ramp(hidden as usize),
+    });
+    for layer in 0..num_layers {
+        // Attention Q/K/V/O
+        w.tensor(GgufTensor {
+            name: format!("blk.{layer}.attn_q.weight"),
+            dims: vec![hidden, hidden],
+            ggml_type: 0,
+            data: gguf_f32_ramp((hidden * hidden) as usize),
+        });
+        w.tensor(GgufTensor {
+            name: format!("blk.{layer}.attn_k.weight"),
+            dims: vec![hidden, hidden],
+            ggml_type: 0,
+            data: gguf_f32_ramp((hidden * hidden) as usize),
+        });
+        w.tensor(GgufTensor {
+            name: format!("blk.{layer}.attn_v.weight"),
+            dims: vec![hidden, hidden],
+            ggml_type: 0,
+            data: gguf_f32_ramp((hidden * hidden) as usize),
+        });
+        w.tensor(GgufTensor {
+            name: format!("blk.{layer}.attn_output.weight"),
+            dims: vec![hidden, hidden],
+            ggml_type: 0,
+            data: gguf_f32_ramp((hidden * hidden) as usize),
+        });
+        // FFN gate/up/down — non-square so orient fires for down
+        w.tensor(GgufTensor {
+            name: format!("blk.{layer}.ffn_gate.weight"),
+            dims: vec![hidden, intermediate],
+            ggml_type: 0,
+            data: gguf_f32_ramp((hidden * intermediate) as usize),
+        });
+        w.tensor(GgufTensor {
+            name: format!("blk.{layer}.ffn_up.weight"),
+            dims: vec![hidden, intermediate],
+            ggml_type: 0,
+            data: gguf_f32_ramp((hidden * intermediate) as usize),
+        });
+        w.tensor(GgufTensor {
+            name: format!("blk.{layer}.ffn_down.weight"),
+            dims: vec![intermediate, hidden],
+            ggml_type: 0,
+            data: gguf_f32_ramp((intermediate * hidden) as usize),
+        });
+        // Per-layer norms
+        w.tensor(GgufTensor {
+            name: format!("blk.{layer}.attn_norm.weight"),
+            dims: vec![hidden],
+            ggml_type: 0,
+            data: gguf_f32_ramp(hidden as usize),
+        });
+        w.tensor(GgufTensor {
+            name: format!("blk.{layer}.ffn_norm.weight"),
+            dims: vec![hidden],
+            ggml_type: 0,
+            data: gguf_f32_ramp(hidden as usize),
+        });
+    }
+    w.write_to_file(path).unwrap();
+}
+
 // ─── down_meta edge arms (missing-tensor + resume skips) ─────────────────
 
 #[test]
@@ -1405,4 +1511,84 @@ fn streaming_extract_resumes_and_skips_down_meta_when_checkpoint_marks_it() {
         down_meta_before, down_meta_after,
         "resumed down_meta.bin must be reused unchanged, not recomputed"
     );
+}
+
+#[test]
+fn gguf_streaming_matches_eager_byte_for_byte() {
+    let num_layers = 2usize;
+    let vocab = 16usize;
+    let hidden: u64 = 4;
+    let intermediate: u64 = 8;
+
+    let tmp = tempfile::tempdir().unwrap();
+
+    let gguf_path = tmp.path().join("model.gguf");
+    write_synthetic_llama_gguf_full(&gguf_path, num_layers, vocab, hidden, intermediate);
+
+    let tok_json =
+        r#"{"version":"1.0","model":{"type":"BPE","vocab":{},"merges":[]},"added_tokens":[]}"#;
+    let tokenizer =
+        larql_vindex::tokenizers::Tokenizer::from_bytes(tok_json.as_bytes()).unwrap();
+
+    // Eager: load all tensors into RAM + build_vindex
+    let eager_dir = tmp.path().join("eager");
+    {
+        let weights = larql_models::load_gguf(&gguf_path).unwrap();
+        let mut cb = SilentBuildCallbacks;
+        build_vindex(
+            &weights,
+            &tokenizer,
+            "test/compare",
+            &eager_dir,
+            5,
+            ExtractLevel::All,
+            StorageDtype::F32,
+            &mut cb,
+        )
+        .expect("eager build_vindex");
+    }
+
+    // Streaming: mmap + one-layer-at-a-time pipeline
+    let streaming_dir = tmp.path().join("streaming");
+    {
+        let mut cb = SilentBuildCallbacks;
+        build_vindex_streaming(
+            &gguf_path,
+            &tokenizer,
+            "test/compare",
+            &streaming_dir,
+            5,
+            0,
+            ExtractLevel::All,
+            StorageDtype::F32,
+            QuantFormat::None,
+            WriteWeightsOptions::default(),
+            KquantWriteOptions::default(),
+            false,
+            &mut cb,
+        )
+        .expect("streaming build_vindex_streaming");
+    }
+
+    let bin_files = &[
+        "gate_vectors.bin",
+        "embeddings.bin",
+        "down_meta.bin",
+        "down_weights.bin",
+        "up_weights.bin",
+        "attn_weights.bin",
+        "norms.bin",
+        "lm_head.bin",
+    ];
+
+    for fname in bin_files {
+        let eager_bytes = std::fs::read(eager_dir.join(fname))
+            .unwrap_or_else(|_| panic!("eager output missing: {fname}"));
+        let streaming_bytes = std::fs::read(streaming_dir.join(fname))
+            .unwrap_or_else(|_| panic!("streaming output missing: {fname}"));
+        assert_eq!(
+            eager_bytes, streaming_bytes,
+            "{fname} differs between eager and streaming GGUF paths"
+        );
+    }
 }

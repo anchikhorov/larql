@@ -23,6 +23,7 @@ use std::io::{BufWriter, Write};
 use ndarray::Array2;
 
 use crate::error::VindexError;
+use crate::format::weights::WeightSource;
 
 /// Mmap'd safetensors file — kept alive for the duration of extraction.
 pub(super) struct MmapShard {
@@ -112,6 +113,14 @@ impl TensorSource {
         match self {
             TensorSource::Safetensors { index, .. } => Some(index),
             TensorSource::Gguf(_) => None,
+        }
+    }
+
+    /// Borrow the GGUF tensor source. Returns `None` for the safetensors variant.
+    pub(super) fn gguf_source(&self) -> Option<&GgufTensorSource> {
+        match self {
+            TensorSource::Gguf(g) => Some(g),
+            _ => None,
         }
     }
 }
@@ -263,6 +272,7 @@ impl GgufTensorSource {
         }
 
         let raw = &mmap[abs_offset_usize..end];
+
         let floats =
             larql_models::quant::ggml::dequantize(raw, info.tensor_type(), n_elements_usize)
                 .map_err(|e| VindexError::Parse(e.to_string()))?;
@@ -283,6 +293,63 @@ impl GgufTensorSource {
             None => arr,
         };
         Ok(Some(arr))
+    }
+
+    /// Read a 1D tensor (vector) by HF-canonical key, dequantising to f32.
+    /// Returns `Ok(None)` if the key is absent, the tensor is not 1D, or the
+    /// dtype is unsupported. Mirrors the 1D arm of the eager GGUF loader
+    /// (`load_gguf` → `n_dims == 1 → vectors.insert(key, floats)`).
+    fn get_vector_f32(&self, key: &str) -> Result<Option<Vec<f32>>, VindexError> {
+        let info_idx = match self.index.get(key) {
+            Some(&i) => i,
+            None => return Ok(None),
+        };
+        let info = &self.gguf.tensor_infos[info_idx];
+        if info.n_dims() != 1 {
+            return Ok(None);
+        }
+
+        let shard_idx = info.shard_idx();
+        let mmap = &self.shard_mmaps[shard_idx];
+        let data_offset = self.gguf.shards[shard_idx].data_offset;
+        let abs_offset = data_offset.checked_add(info.offset()).ok_or_else(|| {
+            VindexError::Parse(format!(
+                "gguf vector {}: data_offset {data_offset} + offset {} overflows",
+                info.name(),
+                info.offset(),
+            ))
+        })?;
+
+        let n_elements = info.dims()[0] as usize;
+        let data_size =
+            larql_models::quant::ggml::tensor_data_size(info.tensor_type(), n_elements)
+                .map_err(|e| VindexError::Parse(e.to_string()))?;
+        let abs_offset_usize = usize::try_from(abs_offset).map_err(|_| {
+            VindexError::Parse(format!(
+                "gguf vector {}: abs_offset {abs_offset} exceeds usize",
+                info.name(),
+            ))
+        })?;
+        let end = abs_offset_usize.checked_add(data_size).ok_or_else(|| {
+            VindexError::Parse(format!(
+                "gguf vector {}: offset+size overflows",
+                info.name(),
+            ))
+        })?;
+        if end > mmap.len() {
+            return Err(VindexError::Parse(format!(
+                "gguf vector {} out of bounds: end {end} > shard len {}",
+                info.name(),
+                mmap.len(),
+            )));
+        }
+
+        let raw = &mmap[abs_offset_usize..end];
+        let floats =
+            larql_models::quant::ggml::dequantize(raw, info.tensor_type(), n_elements)
+                .map_err(|e| VindexError::Parse(e.to_string()))?;
+
+        Ok(Some(floats))
     }
 }
 
@@ -307,6 +374,64 @@ impl Write for GateSink {
             GateSink::File(f) => f.flush(),
             GateSink::Discard(s) => s.flush(),
         }
+    }
+}
+
+/// Weight source backed by mmap'd GGUF tensors.
+/// Tensors are dequantized on demand — peak memory is one tensor at a time.
+pub(super) struct GgufWeightSource<'a> {
+    pub(super) src: &'a GgufTensorSource,
+    pub(super) arch: &'a dyn larql_models::ModelArchitecture,
+    pub(super) num_layers: usize,
+}
+
+impl<'a> WeightSource for GgufWeightSource<'a> {
+    fn get_tensor(&self, key: &str) -> Option<(Vec<f32>, usize, usize)> {
+        let arr = self.src.get_tensor_f32(key).ok()??;
+        let rows = arr.nrows();
+        let cols = arr.ncols();
+        Some((arr.into_raw_vec_and_offset().0, rows, cols))
+    }
+
+    fn get_vector(&self, key: &str) -> Option<Vec<f32>> {
+        self.src.get_vector_f32(key).ok()?
+    }
+
+    fn arch(&self) -> &dyn larql_models::ModelArchitecture {
+        self.arch
+    }
+
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    fn lm_head(&self) -> Option<(Vec<f32>, usize, usize)> {
+        for key in &["lm_head.weight", "output.weight"] {
+            if let Some(t) = self.get_tensor(key) {
+                return Some(t);
+            }
+        }
+        None
+    }
+
+    fn vector_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .src
+            .index
+            .iter()
+            .filter(|(key, &idx)| {
+                let info = &self.src.gguf.tensor_infos[idx];
+                info.n_dims() == 1
+                    && (key.contains("layernorm") || key.contains("norm") || key.contains("bias"))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn get_packed_bf16(&self, _key: &str) -> Option<Vec<u8>> {
+        None // GGUF has no MXFP4-packed format
     }
 }
 

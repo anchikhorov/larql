@@ -491,21 +491,6 @@ fn run_gguf_to_vindex(
             .into());
     }
 
-    eprintln!("  Loading and dequantizing tensors...");
-    let weights = if do_keep_quant {
-        // Retain raw bytes for I2_S BitLinear tensors so the
-        // bitnet_writer can copy them verbatim into bitnet/.
-        const TYPE_I2_S: u32 = 36;
-        larql_models::loading::gguf::load_gguf_keep_quant(input, &[TYPE_I2_S])?
-    } else {
-        larql_models::load_gguf(input)?
-    };
-
-    eprintln!(
-        "  {} layers, hidden_size={}, intermediate_size={}, vocab_size={}",
-        weights.num_layers, weights.hidden_size, weights.intermediate_size, weights.vocab_size
-    );
-
     let extract_level = match level {
         "inference" => larql_vindex::ExtractLevel::Inference,
         "all" => larql_vindex::ExtractLevel::All,
@@ -553,81 +538,120 @@ fn run_gguf_to_vindex(
         .as_ref()
         .ok_or("tokenizer.json not found next to GGUF file. Place it in the same directory.")?;
 
+    // Compute model summary from GGUF metadata for the display line.
+    // Avoids loading all tensors just for the summary.
+    let cfg_json = gguf.to_config_json();
+    let num_layers = cfg_json["num_hidden_layers"].as_u64().unwrap_or(0);
+    let hidden_size = cfg_json["hidden_size"].as_u64().unwrap_or(0);
+    let intermediate_size = cfg_json["intermediate_size"].as_u64().unwrap_or(0);
+    let vocab_size = cfg_json["vocab_size"].as_u64().unwrap_or(0);
+    eprintln!(
+        "  {} layers, hidden_size={}, intermediate_size={}, vocab_size={}",
+        num_layers, hidden_size, intermediate_size, vocab_size,
+    );
+
     eprintln!("\nExtracting to {}", output.display());
 
-    let mut callbacks = SilentCallbacks;
-    if dense_only {
-        eprintln!(
-            "  Dense-only build: skipping gate-vector + clustering stages \
-             (walk / browse disabled; native-ternary /v1/infer only)"
-        );
-        larql_vindex::build_vindex_dense_only(
-            &weights,
-            tokenizer_ref,
-            &model_name,
-            output,
-            dtype,
-            &mut callbacks,
-        )?;
+    if dense_only || do_keep_quant {
+        // Eager path: BitNet --dense-only or --keep-quant needs the full
+        // ModelWeights in RAM (the bitnet_writer consumes raw_bytes).
+        // TODO: streaming BitNet writer — requires I2_S raw bytes via mmap.
+        if dense_only {
+            eprintln!(
+                "  Dense-only build: skipping gate-vector + clustering stages \
+                 (walk / browse disabled; native-ternary /v1/infer only)"
+            );
+        }
+        let weights = if do_keep_quant {
+            const TYPE_I2_S: u32 = 36;
+            larql_models::loading::gguf::load_gguf_keep_quant(input, &[TYPE_I2_S])?
+        } else {
+            larql_models::load_gguf(input)?
+        };
+        let mut callbacks = SilentCallbacks;
+        if dense_only {
+            larql_vindex::build_vindex_dense_only(
+                &weights,
+                tokenizer_ref,
+                &model_name,
+                output,
+                dtype,
+                &mut callbacks,
+            )?;
+        } else {
+            larql_vindex::build_vindex(
+                &weights,
+                tokenizer_ref,
+                &model_name,
+                output,
+                10,
+                extract_level,
+                dtype,
+                &mut callbacks,
+            )?;
+        }
+
+        if do_keep_quant {
+            let arch_get_u32 = |k: &str| {
+                gguf.metadata
+                    .get(k)
+                    .and_then(|v| v.as_u32())
+                    .map(|n| n as usize)
+            };
+            let arch_get_f32 = |k: &str| gguf.metadata.get(k).and_then(|v| v.as_f64());
+            let mut arch = larql_vindex::extract::bitnet_writer::BitnetArchMeta::default();
+            if let Some(eps) = arch_get_f32("bitnet-b1.58.attention.layer_norm_rms_epsilon") {
+                arch.rms_eps = eps as f32;
+            }
+            if let Some(d) = arch_get_u32("bitnet-b1.58.rope.dimension_count") {
+                arch.head_dim = d;
+            }
+            if let Some(n) = arch_get_u32("bitnet-b1.58.attention.head_count") {
+                arch.n_q_heads = n;
+            }
+            if let Some(n) = arch_get_u32("bitnet-b1.58.attention.head_count_kv") {
+                arch.n_kv_heads = n;
+            }
+            if let Some(r) = arch_get_f32("bitnet-b1.58.rope.freq_base") {
+                arch.rope_base = r;
+            }
+            let layout = larql_vindex::extract::bitnet_writer::write_bitnet_artifacts(
+                output, &weights, arch,
+            )?;
+            eprintln!(
+                "  BitNet keep-quant: wrote {} I2_S tensors + {} scale entries \
+                 (heads={}q/{}kv, head_dim={}, eps={:.0e}, rope_base={})",
+                layout.tensors.len(),
+                layout.total_scale_count,
+                arch.n_q_heads,
+                arch.n_kv_heads,
+                arch.head_dim,
+                arch.rms_eps,
+                arch.rope_base,
+            );
+            patch_index_json_with_bitnet_layout(output, &layout)?;
+        }
     } else {
-        larql_vindex::build_vindex(
-            &weights,
+        // Streaming path: mmap GGUF shards, process one layer at a time.
+        // Peak RSS = embeddings + one tensor — safe for >RAM models.
+        let mut callbacks = SilentCallbacks;
+        larql_vindex::build_vindex_streaming(
+            input,
             tokenizer_ref,
             &model_name,
             output,
-            10,
+            10, // down_top_k
+            0,  // summary_features_per_expert (no CLI flag for this)
             extract_level,
             dtype,
+            larql_vindex::QuantFormat::None,
+            larql_vindex::WriteWeightsOptions::default(),
+            larql_vindex::KquantWriteOptions::default(),
+            false, // drop_gate_vectors
             &mut callbacks,
         )?;
     }
 
-    // BitNet --keep-quant: write the I2_S bytes + per-channel scales
-    // and stamp `bitnet_layout` into index.json.
-    if do_keep_quant {
-        // Pull the architecture dims out of the GGUF metadata so the
-        // BitnetLayout in index.json carries everything the runtime
-        // loader needs.  Defaults match BitNet b1.58 2 B 4 T; we
-        // override per-key when the metadata supplies a value.
-        let arch_get_u32 = |k: &str| {
-            gguf.metadata
-                .get(k)
-                .and_then(|v| v.as_u32())
-                .map(|n| n as usize)
-        };
-        let arch_get_f32 = |k: &str| gguf.metadata.get(k).and_then(|v| v.as_f64());
-        let mut arch = larql_vindex::extract::bitnet_writer::BitnetArchMeta::default();
-        if let Some(eps) = arch_get_f32("bitnet-b1.58.attention.layer_norm_rms_epsilon") {
-            arch.rms_eps = eps as f32;
-        }
-        if let Some(d) = arch_get_u32("bitnet-b1.58.rope.dimension_count") {
-            arch.head_dim = d;
-        }
-        if let Some(n) = arch_get_u32("bitnet-b1.58.attention.head_count") {
-            arch.n_q_heads = n;
-        }
-        if let Some(n) = arch_get_u32("bitnet-b1.58.attention.head_count_kv") {
-            arch.n_kv_heads = n;
-        }
-        if let Some(r) = arch_get_f32("bitnet-b1.58.rope.freq_base") {
-            arch.rope_base = r;
-        }
-        let layout =
-            larql_vindex::extract::bitnet_writer::write_bitnet_artifacts(output, &weights, arch)?;
-        eprintln!(
-            "  BitNet keep-quant: wrote {} I2_S tensors + {} scale entries \
-             (heads={}q/{}kv, head_dim={}, eps={:.0e}, rope_base={})",
-            layout.tensors.len(),
-            layout.total_scale_count,
-            arch.n_q_heads,
-            arch.n_kv_heads,
-            arch.head_dim,
-            arch.rms_eps,
-            arch.rope_base,
-        );
-        // Patch index.json with bitnet_layout = layout.
-        patch_index_json_with_bitnet_layout(output, &layout)?;
-    }
     // GGUF conversion: HF metadata (tokenizer_config.json etc.) is not
     // packed in the GGUF itself, but if the user kept the HF files next
     // to the `.gguf`, snapshot them. Missing-file case is a no-op.
@@ -647,15 +671,7 @@ fn run_safetensors_to_vindex(
     level: &str,
     use_f16: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // This is essentially extract-index
-    eprintln!("Loading safetensors: {}", input.display());
-    let weights = larql_models::load_model_dir(input)?;
-    let tokenizer = larql_vindex::load_vindex_tokenizer(input).or_else(|_| {
-        // Try to load from the model directory
-        let tok_path = input.join(TOKENIZER_JSON);
-        larql_vindex::tokenizers::Tokenizer::from_file(&tok_path)
-            .map_err(|e| larql_vindex::VindexError::Parse(e.to_string()))
-    })?;
+    eprintln!("Converting safetensors: {}", input.display());
 
     let extract_level = match level {
         "inference" => larql_vindex::ExtractLevel::Inference,
@@ -674,22 +690,31 @@ fn run_safetensors_to_vindex(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "model".into());
 
+    let tokenizer = larql_vindex::load_vindex_tokenizer(input).or_else(|_| {
+        let tok_path = input.join(TOKENIZER_JSON);
+        larql_vindex::tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| larql_vindex::VindexError::Parse(e.to_string()))
+    })?;
+
     eprintln!("Extracting to {}", output.display());
 
     let mut callbacks = SilentCallbacks;
-    larql_vindex::build_vindex(
-        &weights,
+    larql_vindex::build_vindex_streaming(
+        input,
         &tokenizer,
         &model_name,
         output,
         10,
+        0,
         extract_level,
         dtype,
+        larql_vindex::QuantFormat::None,
+        larql_vindex::WriteWeightsOptions::default(),
+        larql_vindex::KquantWriteOptions::default(),
+        false,
         &mut callbacks,
     )?;
-    // Snapshot HF-side metadata (chat template, special tokens, generation
-    // config) from the source directory. `input` here is the safetensors
-    // model dir, which is where these files live in the HF cache.
+
     if let Err(e) = larql_vindex::snapshot_hf_metadata(input, output) {
         eprintln!("  warning: failed to snapshot HF metadata: {e}");
     }

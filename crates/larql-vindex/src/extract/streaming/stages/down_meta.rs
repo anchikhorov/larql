@@ -188,12 +188,22 @@ impl<'a> StreamingContext<'a> {
                         let col = chunk_logits.column(feat - batch_start);
                         let mut scores: Vec<(usize, f32)> =
                             col.iter().copied().enumerate().collect();
+                        let nan_count = scores.iter().filter(|(_, s)| s.is_nan()).count();
+                        if nan_count > 0 {
+                            eprintln!(
+                                "  warning: {} NaN scores in down_meta layer={} feat={} (of {} total)",
+                                nan_count, layer, feat, scores.len(),
+                            );
+                            scores.retain(|(_, s)| !s.is_nan());
+                        }
                         let k = self.down_top_k.min(scores.len());
                         if k > 0 && k < scores.len() {
-                            scores.select_nth_unstable_by(k, |a, b| b.1.partial_cmp(&a.1).unwrap());
+                            scores.select_nth_unstable_by(k, |a, b| {
+                                b.1.total_cmp(&a.1)
+                            });
                         }
                         scores.truncate(k);
-                        scores.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        scores.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
                         let top_k_entries: Vec<larql_models::TopKEntry> = scores
                             .into_iter()

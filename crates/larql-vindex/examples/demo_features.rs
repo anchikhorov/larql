@@ -566,7 +566,7 @@ STAGE edge
     q8_block.push(42);
     q8_block.push(0xD6u8); // 42, -42 as i8
     q8_block.extend_from_slice(&[0u8; 30]);
-    let q8_result = larql_models::quant::ggml::dequantize(&q8_block, 6, 32).unwrap();
+    let q8_result = larql_models::quant::ggml::dequantize(&q8_block, larql_models::quant::ggml::TYPE_Q8_0, 32).unwrap();
     println!(
         "  GGML Q8_0: scale=1.0, quants=[42,-42,...] → [{:.1}, {:.1}, ...] ✓",
         q8_result[0], q8_result[1]
