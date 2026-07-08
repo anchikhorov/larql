@@ -3,6 +3,7 @@
 pub mod bitnet_loader;
 pub mod bitnet_writer;
 pub mod build;
+pub mod debug;
 pub mod build_from_vectors;
 pub mod build_helpers;
 pub mod callbacks;

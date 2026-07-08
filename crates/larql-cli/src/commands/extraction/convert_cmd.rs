@@ -802,7 +802,7 @@ fn patch_index_json_with_bitnet_layout(
 
 fn reconstruct_tokenizer_from_gguf(
     metadata: &std::collections::HashMap<String, larql_models::loading::gguf::GgufValue>,
-) -> Result<larql_vindex::tokenizers::Tokenizer, Box<dyn std::error::Error>> {
+) -> Result<larql_vindex::tokenizers::Tokenizer, Box<dyn std::error::Error + Send + Sync>> {
     let tokens_val = metadata.get("tokenizer.ggml.tokens")
         .ok_or("tokenizer.ggml.tokens not found in GGUF metadata")?;
     

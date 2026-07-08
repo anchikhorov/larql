@@ -538,6 +538,21 @@ fn main() {
 }
 
 fn real_main() -> i32 {
+    // Prevent BLAS/OpenBLAS oversubscription: larql parallelises via
+    // rayon, so each worker should run a single-threaded gemm. OpenBLAS
+    // reads these env vars at library init (first gemm call) — set
+    // before any matmul.
+    for var in [
+        "OPENBLAS_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "GOTO_NUM_THREADS",
+    ] {
+        if std::env::var_os(var).is_none() {
+            std::env::set_var(var, "1");
+        }
+    }
+
     let raw_args: Vec<String> = std::env::args().collect();
     let args = rewrite_legacy_argv(raw_args);
     let cli = Cli::parse_from(args);
