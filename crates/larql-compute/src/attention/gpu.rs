@@ -279,8 +279,8 @@ pub fn run_attention_with_kv_backend(
     let pos_divisor =
         crate::forward_overrides::effective_rope_position_divisor_for_layer(arch, layer);
     let llama3 = crate::forward_overrides::effective_llama3_rope_scaling(arch);
-    let q_r = apply_rope_partial_at_full(&q, nq, hd, rb, rf, 0, pos_divisor, llama3);
-    let k_r = apply_rope_partial_at_full(&k, nkv, hd, rb, rf, 0, pos_divisor, llama3);
+    let q_r = apply_rope_partial_at_full(&q, nq, hd, rb, rf, 0, pos_divisor, llama3, arch.rope_proportional_scaling_for_layer(layer));
+    let k_r = apply_rope_partial_at_full(&k, nkv, hd, rb, rf, 0, pos_divisor, llama3, arch.rope_proportional_scaling_for_layer(layer));
 
     let (attn_out, _) = gqa_attention_with_weights(
         &q_r,

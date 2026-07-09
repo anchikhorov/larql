@@ -160,15 +160,6 @@ impl ModelArchitecture for Gemma4Arch {
         self.kv_sources.get(layer).copied().flatten()
     }
 
-    // Gemma 4 uses QK-norm which already normalizes dot products.
-    // No additional 1/sqrt(head_dim) scaling is applied (scaling = 1.0).
-    fn attention_scale(&self) -> f64 {
-        1.0
-    }
-
-    fn attention_scale_for_layer(&self, _layer: usize) -> f64 {
-        1.0
-    }
 
     fn layer_scalar_key(&self, layer: usize) -> Option<String> {
         Some(format!("{}layer_scalar", self.layer_prefix(layer)))
@@ -231,6 +222,10 @@ impl ModelArchitecture for Gemma4Arch {
         } else {
             self.config.rope_base
         }
+    }
+
+    fn rope_proportional_scaling_for_layer(&self, layer: usize) -> bool {
+        self.is_global_layer(layer)
     }
 
     // ── Hybrid MoE (26B A4B: dense MLP + expert block, outputs summed) ──

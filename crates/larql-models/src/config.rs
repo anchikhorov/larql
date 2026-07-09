@@ -858,6 +858,14 @@ pub trait ModelArchitecture: Send + Sync {
         1.0
     }
 
+    /// Returns true if this layer uses proportional RoPE frequency scaling
+    /// (where inverse frequencies are scaled by the full `head_dim` rather
+    /// than the reduced `rotary_dim` under a partial rotary fraction).
+    /// Used by Gemma 4 global layers.
+    fn rope_proportional_scaling_for_layer(&self, _layer: usize) -> bool {
+        false
+    }
+
     /// `llama3` RoPE scaling parameters when the architecture uses them.
     /// Default: `None`. Llama 3.x overrides to return the parsed factor
     /// and frequency-band thresholds. Consumed by

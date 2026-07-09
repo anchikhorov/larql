@@ -227,6 +227,7 @@ pub fn run_attention_block_decode_step_backend(
         position,
         pos_divisor,
         llama3,
+        arch.rope_proportional_scaling_for_layer(layer),
     );
 
     // New token's K, V — RoPE'd at `position`, then appended to cache.
@@ -271,6 +272,7 @@ pub fn run_attention_block_decode_step_backend(
         position,
         pos_divisor,
         llama3,
+        arch.rope_proportional_scaling_for_layer(layer),
     );
 
     // Concatenate cache + new along seq axis.
@@ -582,6 +584,7 @@ pub fn decode_step_project_q4k_direct(
         position,
         pos_divisor,
         llama3,
+        arch.rope_proportional_scaling_for_layer(layer),
     );
 
     let mut k_full_new = direct_proj(backend, &wk, &h_norm, &mut h_norm_q8k, int8, kv_dim, hidden)?;
@@ -617,6 +620,7 @@ pub fn decode_step_project_q4k_direct(
         position,
         pos_divisor,
         llama3,
+        arch.rope_proportional_scaling_for_layer(layer),
     );
 
     Some(Q4kDecodeProj {

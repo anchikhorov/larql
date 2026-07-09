@@ -400,6 +400,7 @@ fn run_attention_block_core(
         0,
         pos_divisor,
         llama3,
+        arch.rope_proportional_scaling_for_layer(layer),
     );
 
     // K/V: either from shared cache or computed fresh.
@@ -476,6 +477,7 @@ fn run_attention_block_core(
             0,
             pos_divisor,
             llama3,
+            arch.rope_proportional_scaling_for_layer(layer),
         );
         (k_r, v_full)
     };

@@ -541,16 +541,74 @@ fn real_main() -> i32 {
     // Prevent BLAS/OpenBLAS oversubscription: larql parallelises via
     // rayon, so each worker should run a single-threaded gemm. OpenBLAS
     // reads these env vars at library init (first gemm call) — set
-    // before any matmul.
+    // before matmul.
+    // 1. First, parse the arguments (this does not initialize BLAS)
+    let raw_args: Vec<String> = std::env::args().collect();
+    let args = rewrite_legacy_argv(raw_args);
+    let cli = Cli::parse_from(args);
+
+    // 2. Determine whether we need hard thread locking.
+    // Disable OpenBLAS multithreading ONLY for those commands
+    // that themselves parallelize the workload through Rayon.
+    // let limit_blas = match &cli.command {
+    //     Commands::Extract(_)
+    //     | Commands::ExtractIndex(_)
+    //     | Commands::Build(_)
+    //     | Commands::Convert(_) => true,
+    //     Commands::Dev(DevCommand::WeightExtract(_))
+    //     | Commands::Dev(DevCommand::VectorExtract(_)) => true,
+    //     _ => false, // For INFER, Run, Chat, LQL we allow the use of ALL cores
+    // };
+
+    // // 3. Apply the limit only if it is an extraction
+    // if limit_blas {
+    //     for var in [
+    //         "OPENBLAS_NUM_THREADS",
+    //         "OMP_NUM_THREADS",
+    //         "MKL_NUM_THREADS",
+    //         "GOTO_NUM_THREADS",
+    //     ] {
+    //         if std::env::var_os(var).is_none() {
+    //             std::env::set_var(var, "1");
+    //         }
+    //     }
+    // }
+    let available_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4); // Fallback to 4 cores if the OS blocked the call
+
+    let available_threads_str = available_threads.to_string();
+
+    let (num_threads_blas, num_threads_rayon) = match &cli.command {
+        // When extracting: Rayon uses all cores, BLAS strictly in 1 thread
+        Commands::Extract(_)
+        | Commands::ExtractIndex(_)
+        | Commands::Build(_)
+        | Commands::Convert(_) => ("1", 0),
+
+        // When inferencing: Rayon does not spawn workers, we give all available OpenBLAS threads
+        Commands::Run(_) | Commands::Chat(_) | Commands::Lql(_) => {
+            (available_threads_str.as_str(), 1)
+        }
+
+        _ => ("1", 0),
+    };
+
+    // Setting up math backends
     for var in [
         "OPENBLAS_NUM_THREADS",
         "OMP_NUM_THREADS",
         "MKL_NUM_THREADS",
         "GOTO_NUM_THREADS",
     ] {
-        if std::env::var_os(var).is_none() {
-            std::env::set_var(var, "1");
-        }
+        std::env::set_var(var, num_threads_blas);
+    }
+
+    // If there is inference, we strictly limit the global Rayon pool so that Rust does not spawn unnecessary threads.
+    if num_threads_rayon == 1 {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build_global();
     }
 
     let raw_args: Vec<String> = std::env::args().collect();
