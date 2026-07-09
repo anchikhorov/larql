@@ -716,6 +716,7 @@ mod branch_tests {
             packed_mmaps: HashMap::new(),
             skipped_tensors: Vec::new(),
             packed_byte_ranges: HashMap::new(),
+            layer_tensors_manifest: HashMap::new(),
             embed,
             lm_head,
             position_embed: None,

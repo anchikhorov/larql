@@ -110,6 +110,7 @@ mod tests {
             logits_scaling: Some(10.0),
             global_head_dim: None,
             num_global_kv_heads: None,
+            num_global_q_heads: None,
             partial_rotary_factor: None,
             sliding_window_pattern: None,
             layer_types: None,

@@ -242,6 +242,7 @@ impl LoadedModel {
                     skip_lm_head: false,
                     skip_embed: true,
                     skip_ffn: true,
+                    ..Default::default()
                 }
             } else {
                 if self.ffn_only {
@@ -255,6 +256,7 @@ impl LoadedModel {
                     skip_lm_head: self.ffn_only,
                     skip_embed: self.ffn_only,
                     skip_ffn: self.ffn_only,
+                    ..Default::default()
                 }
             };
             larql_vindex::load_model_weights_with_opts(&self.path, &mut cb, opts)

@@ -1878,6 +1878,7 @@ pub fn load_bitnet_model(vindex_path: &std::path::Path) -> Result<BitnetModel, B
         skip_ffn: true,
         skip_lm_head: false,
         skip_embed: false,
+        ..Default::default()
     };
     let mut callbacks = larql_vindex::SilentLoadCallbacks;
     let dense = larql_vindex::load_model_weights_with_opts(vindex_path, &mut callbacks, opts)?;

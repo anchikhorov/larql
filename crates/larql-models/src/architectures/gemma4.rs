@@ -129,11 +129,12 @@ impl ModelArchitecture for Gemma4Arch {
         }
     }
 
-    fn num_q_heads_for_layer(&self, _layer: usize) -> usize {
-        // Gemma 4 keeps num_q_heads constant across all layers.
-        // At global layers, each head uses global_head_dim instead of head_dim,
-        // so Q projection output is larger (num_q * global_head_dim).
-        self.config.num_q_heads
+    fn num_q_heads_for_layer(&self, layer: usize) -> usize {
+        if self.is_global_layer(layer) {
+            self.config.num_global_q_heads.unwrap_or(self.config.num_q_heads)
+        } else {
+            self.config.num_q_heads
+        }
     }
 
     fn rotary_fraction_for_layer(&self, layer: usize) -> f64 {

@@ -141,6 +141,8 @@ pub struct ModelConfig {
     pub global_head_dim: Option<usize>,
     /// Number of KV heads for global attention layers. If None, all layers use num_kv_heads.
     pub num_global_kv_heads: Option<usize>,
+    /// Number of Q heads for global attention layers. If None, all layers use num_q_heads.
+    pub num_global_q_heads: Option<usize>,
     /// Fraction of head_dim dimensions to apply RoPE to (0.0–1.0). If None, full rotation.
     pub partial_rotary_factor: Option<f64>,
     /// Sliding window pattern: every Nth layer is full attention.

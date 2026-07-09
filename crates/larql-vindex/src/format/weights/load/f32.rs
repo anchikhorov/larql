@@ -82,6 +82,7 @@ pub fn load_model_weights_with_opts(
     let mut lm_head_loaded: Option<larql_models::WeightArray> = None;
     let mut packed_mmaps: HashMap<String, memmap2::Mmap> = HashMap::new();
     let mut packed_byte_ranges: HashMap<String, (String, usize, usize)> = HashMap::new();
+    let mut layer_tensors_manifest: HashMap<String, larql_models::LayerTensorInfo> = HashMap::new();
 
     for entry in &entries {
         // Pre-load filter: skip entries we don't need — never mmap or
@@ -119,6 +120,31 @@ pub fn load_model_weights_with_opts(
         if byte_offset + byte_count > data.len() {
             continue;
         }
+        // Check if this is a layer 2D tensor to be loaded on-demand
+        let is_layer_tensor = !opts.eager_load_layers && entry.key.starts_with("layers.") && 
+            (entry.kind == kind::TENSOR || entry.kind == kind::TENSOR_F16);
+        
+        if is_layer_tensor {
+            let expected_floats: usize = entry.shape.iter().product();
+            let is_f32 = byte_count == expected_floats * 4;
+            layer_tensors_manifest.insert(
+                entry.key.clone(),
+                larql_models::LayerTensorInfo {
+                    file: filename.clone(),
+                    offset: byte_offset,
+                    length: byte_count,
+                    shape: entry.shape.clone(),
+                    is_f32,
+                },
+            );
+            // Also keep the mmap file handle alive by adding to packed_byte_ranges
+            packed_byte_ranges.insert(
+                entry.key.clone(),
+                (filename.clone(), byte_offset, byte_count),
+            );
+            continue;
+        }
+
         let raw_bytes = &data[byte_offset..byte_offset + byte_count];
         // Detect actual dtype from byte count vs expected shape.
         // Gate vector conversion may have changed index.json dtype to f32
@@ -184,7 +210,7 @@ pub fn load_model_weights_with_opts(
     if arch.has_per_layer_embeddings() {
         let mut missing: Vec<String> = Vec::new();
         let require_tensor = |key: &str, missing: &mut Vec<String>| {
-            if !tensors.contains_key(key) {
+            if !tensors.contains_key(key) && !layer_tensors_manifest.contains_key(key) {
                 missing.push(key.to_string());
             }
         };
@@ -271,7 +297,7 @@ pub fn load_model_weights_with_opts(
         let mut missing = Vec::new();
         for layer in 0..config.num_layers {
             for key in [arch.ffn_up_key(layer), arch.ffn_down_key(layer)] {
-                if !tensors.contains_key(&key) {
+                if !tensors.contains_key(&key) && !layer_tensors_manifest.contains_key(&key) {
                     missing.push(key);
                 }
             }
@@ -345,6 +371,7 @@ pub fn load_model_weights_with_opts(
         skipped_tensors: Vec::new(),
         packed_mmaps,
         packed_byte_ranges,
+        layer_tensors_manifest,
         embed,
         lm_head,
         position_embed: None,

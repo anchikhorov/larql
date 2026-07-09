@@ -286,6 +286,7 @@ pub fn write_synthetic_model_dir(dir: &std::path::Path) -> Result<(), String> {
         moe: None::<MoeConfig>,
         global_head_dim: None,
         num_global_kv_heads: None,
+        num_global_q_heads: None,
         partial_rotary_factor: None,
         sliding_window_pattern: None,
         layer_types: None,
@@ -410,6 +411,7 @@ pub fn write_synthetic_q4k_model_dir_layers(
         moe: None::<MoeConfig>,
         global_head_dim: None,
         num_global_kv_heads: None,
+        num_global_q_heads: None,
         partial_rotary_factor: None,
         sliding_window_pattern: None,
         layer_types: None,
@@ -884,6 +886,7 @@ pub fn make_test_gemma4_moe_weights() -> ModelWeights {
         packed_mmaps: HashMap::new(),
         skipped_tensors: Vec::new(),
         packed_byte_ranges: HashMap::new(),
+        layer_tensors_manifest: HashMap::new(),
         embed,
         lm_head,
         position_embed: None,
@@ -959,10 +962,14 @@ mod synthetic_model_dir_tests {
         // Round-tripped tensors must be retrievable by the arch-keyed
         // names the forward pass walks — pick a representative entry.
         assert!(
-            weights.tensors.contains_key(&weights.arch.attn_q_key(0)),
+            weights.tensors.contains_key(&weights.arch.attn_q_key(0))
+                || weights.layer_tensors_manifest.contains_key(&weights.arch.attn_q_key(0)),
             "expected attn_q tensor for layer 0 after round-trip"
         );
-        assert!(weights.tensors.contains_key(&weights.arch.ffn_gate_key(0)));
+        assert!(
+            weights.tensors.contains_key(&weights.arch.ffn_gate_key(0))
+                || weights.layer_tensors_manifest.contains_key(&weights.arch.ffn_gate_key(0))
+        );
     }
 
     #[test]

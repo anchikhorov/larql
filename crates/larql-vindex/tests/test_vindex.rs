@@ -787,6 +787,7 @@ fn v2_config_full_round_trip() {
             moe: None,
             global_head_dim: None,
             num_global_kv_heads: None,
+            num_global_q_heads: None,
             partial_rotary_factor: None,
             sliding_window_pattern: None,
             layer_types: None,
@@ -882,6 +883,7 @@ fn v2_config_with_moe() {
             }),
             global_head_dim: None,
             num_global_kv_heads: None,
+            num_global_q_heads: None,
             partial_rotary_factor: None,
             sliding_window_pattern: None,
             layer_types: None,
@@ -1019,6 +1021,7 @@ fn moe_layer_info_round_trip() {
             }),
             global_head_dim: None,
             num_global_kv_heads: None,
+            num_global_q_heads: None,
             partial_rotary_factor: None,
             sliding_window_pattern: None,
             layer_types: None,
@@ -1942,6 +1945,7 @@ fn make_synthetic_model() -> larql_models::ModelWeights {
         skipped_tensors: Vec::new(),
         packed_mmaps: std::collections::HashMap::new(),
         packed_byte_ranges: std::collections::HashMap::new(),
+        layer_tensors_manifest: std::collections::HashMap::new(),
         embed,
         lm_head,
         position_embed: None,
@@ -2135,13 +2139,13 @@ fn extract_then_load_weights_round_trip() {
 
     // Verify up/down from split files
     let up_key = loaded.arch.ffn_up_key(0);
-    assert!(loaded.tensors.contains_key(&up_key));
+    assert!(loaded.get_tensor_or_decode(&up_key).is_some());
     let down_key = loaded.arch.ffn_down_key(0);
-    assert!(loaded.tensors.contains_key(&down_key));
+    assert!(loaded.get_tensor_or_decode(&down_key).is_some());
 
     // Verify attention weights
     let q_key = loaded.arch.attn_q_key(0);
-    assert!(loaded.tensors.contains_key(&q_key));
+    assert!(loaded.get_tensor_or_decode(&q_key).is_some());
 
     // Verify norms
     assert!(!loaded.vectors.is_empty());
@@ -4112,13 +4116,11 @@ fn streaming_extract_noquant_carries_ple_tensors() {
         let gate_key = format!("layers.{layer}.per_layer_input_gate.weight");
         let proj_key = format!("layers.{layer}.per_layer_projection.weight");
         let gate = weights
-            .tensors
-            .get(&gate_key)
+            .get_tensor_or_decode(&gate_key)
             .unwrap_or_else(|| panic!("{gate_key} missing"));
         assert_eq!(gate.shape(), &[ple_dim, hidden]);
         let proj = weights
-            .tensors
-            .get(&proj_key)
+            .get_tensor_or_decode(&proj_key)
             .unwrap_or_else(|| panic!("{proj_key} missing"));
         assert_eq!(proj.shape(), &[hidden, ple_dim]);
 

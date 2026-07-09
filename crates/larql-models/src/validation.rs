@@ -30,6 +30,7 @@ pub const FIELD_ATTENTION_MULTIPLIER: &str = "attention_multiplier";
 pub const FIELD_LOGITS_SCALING: &str = "logits_scaling";
 pub const FIELD_GLOBAL_HEAD_DIM: &str = "global_head_dim";
 pub const FIELD_NUM_GLOBAL_KV_HEADS: &str = "num_global_kv_heads";
+pub const FIELD_NUM_GLOBAL_Q_HEADS: &str = "num_global_q_heads";
 pub const FIELD_PARTIAL_ROTARY_FACTOR: &str = "partial_rotary_factor";
 pub const FIELD_SLIDING_WINDOW_PATTERN: &str = "sliding_window_pattern";
 pub const FIELD_LAYER_TYPES: &str = "layer_types";
@@ -154,6 +155,15 @@ pub(crate) fn validate_architecture<A: ModelArchitecture + ?Sized>(
             FIELD_NUM_GLOBAL_KV_HEADS,
             cfg.num_q_heads,
             num_global_kv_heads,
+        );
+    }
+
+    if let Some(num_global_q_heads) = cfg.num_global_q_heads {
+        validate_attention_heads(
+            &mut errors,
+            FIELD_NUM_GLOBAL_Q_HEADS,
+            cfg.num_q_heads,
+            num_global_q_heads,
         );
     }
 

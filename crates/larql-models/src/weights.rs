@@ -87,6 +87,10 @@ impl<'a> WeightsView<'a> {
     pub fn canonical(&self) -> &'a ModelWeights {
         self.weights
     }
+
+    pub fn scratch(&self) -> Option<&'a DequantScratch> {
+        self.scratch
+    }
 }
 
 impl<'a> From<&'a ModelWeights> for WeightsView<'a> {
@@ -137,6 +141,15 @@ pub(crate) const ATTN_TENSOR_PATTERNS: &[&str] = &[
     "k_norm",
 ];
 
+#[derive(Clone, Debug, Default)]
+pub struct LayerTensorInfo {
+    pub file: String,
+    pub offset: usize,
+    pub length: usize,
+    pub shape: Vec<usize>,
+    pub is_f32: bool,
+}
+
 /// A loaded model's weight tensors, configuration, and architecture.
 pub struct ModelWeights {
     pub tensors: HashMap<String, WeightArray>,
@@ -155,6 +168,7 @@ pub struct ModelWeights {
     pub skipped_tensors: Vec<(String, String)>,
     /// Byte ranges into `packed_mmaps`: maps tensor key → (file_name, offset, length).
     pub packed_byte_ranges: HashMap<String, (String, usize, usize)>,
+    pub layer_tensors_manifest: HashMap<String, LayerTensorInfo>,
     pub embed: WeightArray,
     /// Output projection matrix. Same as embed if tie_word_embeddings=true,
     /// separate lm_head.weight otherwise.
@@ -353,6 +367,92 @@ impl ModelWeights {
         self.embed = ndarray::ArcArray2::from_shape_vec((0, 0), Vec::new())
             .expect("empty 0x0 array is always valid");
         freed
+    }
+
+    /// Load and decode layer tensors for `layer` into `scratch` from memory-mapped files.
+    pub fn load_layer_tensors_into_scratch(&self, layer: usize, scratch: &mut DequantScratch) {
+        let prefix = format!("layers.{}.", layer);
+        for (key, info) in &self.layer_tensors_manifest {
+            if key.starts_with(&prefix) {
+                if let Some(mmap) = self.packed_mmaps.get(&info.file) {
+                    if let Some(raw_bytes) = mmap.get(info.offset..info.offset + info.length) {
+                        let floats = if info.is_f32 {
+                            let floats_slice: &[f32] = unsafe {
+                                std::slice::from_raw_parts(
+                                    raw_bytes.as_ptr() as *const f32,
+                                    raw_bytes.len() / 4,
+                                )
+                            };
+                            floats_slice.to_vec()
+                        } else {
+                            crate::quant::half::decode_f16(raw_bytes)
+                        };
+                        
+                        if info.shape.len() == 2 {
+                            if let Ok(arr) = ndarray::Array2::from_shape_vec(
+                                (info.shape[0], info.shape[1]),
+                                floats,
+                            ) {
+                                scratch.insert(key.clone(), arr.into_shared());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Evict pages for all layer tensors of a given layer from OS page cache.
+    pub fn evict_layer_pages(&self, layer: usize) {
+        #[cfg(unix)]
+        {
+            let prefix = format!("layers.{}.", layer);
+            for (key, info) in &self.layer_tensors_manifest {
+                if key.starts_with(&prefix) {
+                    if let Some(mmap) = self.packed_mmaps.get(&info.file) {
+                        let ptr = mmap.as_ptr();
+                        unsafe {
+                            // Align address and length to page boundaries for madvise
+                            let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                            let offset_aligned = (info.offset / page_size) * page_size;
+                            let diff = info.offset - offset_aligned;
+                            let addr_aligned = ptr.add(offset_aligned) as *mut libc::c_void;
+                            let len_aligned = info.length + diff;
+
+                            let _ = libc::madvise(addr_aligned, len_aligned, libc::MADV_DONTNEED);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Retrieve a tensor from cache/heap, or decode it on-demand from memory-mapped files.
+    pub fn get_tensor_or_decode(&self, key: &str) -> Option<WeightArray> {
+        if let Some(t) = self.tensors.get(key) {
+            return Some(t.clone());
+        }
+        let info = self.layer_tensors_manifest.get(key)?;
+        let mmap = self.packed_mmaps.get(&info.file)?;
+        let raw_bytes = mmap.get(info.offset..info.offset + info.length)?;
+        let floats = if info.is_f32 {
+            let floats_slice: &[f32] = unsafe {
+                std::slice::from_raw_parts(
+                    raw_bytes.as_ptr() as *const f32,
+                    raw_bytes.len() / 4,
+                )
+            };
+            floats_slice.to_vec()
+        } else {
+            crate::quant::half::decode_f16(raw_bytes)
+        };
+        if info.shape.len() == 2 {
+            ndarray::Array2::from_shape_vec((info.shape[0], info.shape[1]), floats)
+                .ok()
+                .map(|arr| arr.into_shared())
+        } else {
+            None
+        }
     }
 }
 

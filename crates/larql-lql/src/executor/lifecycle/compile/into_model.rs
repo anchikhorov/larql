@@ -46,8 +46,15 @@ impl Session {
         config: &larql_vindex::VindexConfig,
     ) -> Result<Vec<String>, LqlError> {
         let mut cb = larql_vindex::SilentLoadCallbacks;
-        let mut weights = larql_vindex::load_model_weights(vindex_path, &mut cb)
-            .map_err(|e| LqlError::exec("failed to load model weights", e))?;
+        let mut weights = larql_vindex::load_model_weights_with_opts(
+            vindex_path,
+            &mut cb,
+            larql_vindex::LoadWeightsOptions {
+                eager_load_layers: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| LqlError::exec("failed to load model weights", e))?;
 
         // ── MEMIT: compile patch overlay into W_down edits ──
         //

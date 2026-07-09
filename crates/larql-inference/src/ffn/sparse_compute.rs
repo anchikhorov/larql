@@ -82,8 +82,8 @@ fn sparse_ffn_forward_impl(
     overrides: &[(usize, &[f32])],
 ) -> (Array2<f32>, Array2<f32>) {
     let arch = &*weights.arch;
-    let w_up = weights.tensors.get(&arch.ffn_up_key(layer)).unwrap();
-    let w_down = weights.tensors.get(&arch.ffn_down_key(layer)).unwrap();
+    let w_up = weights.get_tensor_or_decode(&arch.ffn_up_key(layer)).unwrap();
+    let w_down = weights.get_tensor_or_decode(&arch.ffn_down_key(layer)).unwrap();
     let hidden = x.shape()[1];
     let intermediate = w_up.shape()[0];
     let seq_len = x.shape()[0];
@@ -98,7 +98,18 @@ fn sparse_ffn_forward_impl(
 
     // Fall back to dense when most features are selected
     if k * 5 >= intermediate * 4 && overrides.is_empty() {
-        return dense_ffn_forward(larql_models::WeightsView::dense(weights), layer, x);
+        let mut scratch = larql_models::DequantScratch::new();
+        weights.load_layer_tensors_into_scratch(layer, &mut scratch);
+        let view = if scratch.is_empty() {
+            larql_models::WeightsView::dense(weights)
+        } else {
+            larql_models::WeightsView::with_scratch(weights, &scratch)
+        };
+        let res = dense_ffn_forward(view, layer, x);
+        if !scratch.is_empty() {
+            weights.evict_layer_pages(layer);
+        }
+        return res;
     }
 
     let is_gated = arch.ffn_type() == larql_models::FfnType::Gated;
@@ -108,13 +119,13 @@ fn sparse_ffn_forward_impl(
     );
 
     // Gather weight rows for selected features
-    let up_buf = gather_rows(w_up, features, hidden);
+    let up_buf = gather_rows(&w_up, features, hidden);
     let up_sub = ndarray::ArrayView2::from_shape((k, hidden), &up_buf).unwrap();
 
     let _gate_buf;
     let gate_sub = if is_gated {
-        let w_gate = weights.tensors.get(&arch.ffn_gate_key(layer)).unwrap();
-        _gate_buf = gather_rows(w_gate, features, hidden);
+        let w_gate = weights.get_tensor_or_decode(&arch.ffn_gate_key(layer)).unwrap();
+        _gate_buf = gather_rows(&w_gate, features, hidden);
         Some(ndarray::ArrayView2::from_shape((k, hidden), &_gate_buf).unwrap())
     } else {
         _gate_buf = Vec::new();
@@ -122,7 +133,7 @@ fn sparse_ffn_forward_impl(
     };
 
     // Gather down-projection columns: w_down[:, features] → [hidden, K]
-    let down_sub = gather_columns(w_down, features, hidden);
+    let down_sub = gather_columns(&w_down, features, hidden);
     let down_view = ndarray::ArrayView2::from_shape((hidden, k), &down_sub).unwrap();
 
     // Override lookup (only built when overrides are present)
@@ -221,8 +232,8 @@ fn sparse_ffn_forward_full_impl(
     overrides: &[FeatureSlotOverride<'_>],
 ) -> (Array2<f32>, Array2<f32>) {
     let arch = &*weights.arch;
-    let w_up = weights.tensors.get(&arch.ffn_up_key(layer)).unwrap();
-    let w_down = weights.tensors.get(&arch.ffn_down_key(layer)).unwrap();
+    let w_up = weights.get_tensor_or_decode(&arch.ffn_up_key(layer)).unwrap();
+    let w_down = weights.get_tensor_or_decode(&arch.ffn_down_key(layer)).unwrap();
     let hidden = x.shape()[1];
     let intermediate = w_up.shape()[0];
     let seq_len = x.shape()[0];
@@ -245,20 +256,20 @@ fn sparse_ffn_forward_full_impl(
     // applied below by re-computing the dot products for the
     // overridden slots only — the unchanged slots use the gathered
     // values from the dense weights.
-    let up_buf = gather_rows(w_up, features, hidden);
+    let up_buf = gather_rows(&w_up, features, hidden);
     let up_sub = ndarray::ArrayView2::from_shape((k, hidden), &up_buf).unwrap();
 
     let _gate_buf;
     let gate_sub = if is_gated {
-        let w_gate = weights.tensors.get(&arch.ffn_gate_key(layer)).unwrap();
-        _gate_buf = gather_rows(w_gate, features, hidden);
+        let w_gate = weights.get_tensor_or_decode(&arch.ffn_gate_key(layer)).unwrap();
+        _gate_buf = gather_rows(&w_gate, features, hidden);
         Some(ndarray::ArrayView2::from_shape((k, hidden), &_gate_buf).unwrap())
     } else {
         _gate_buf = Vec::new();
         None
     };
 
-    let down_sub = gather_columns(w_down, features, hidden);
+    let down_sub = gather_columns(&w_down, features, hidden);
     let down_view = ndarray::ArrayView2::from_shape((hidden, k), &down_sub).unwrap();
 
     // Per-feature override lookup. Built once.
@@ -467,10 +478,10 @@ pub fn select_top_k_features(
     );
 
     let proj = if is_gated {
-        let w_gate = weights.tensors.get(&arch.ffn_gate_key(layer)).unwrap();
+        let w_gate = weights.get_tensor_or_decode(&arch.ffn_gate_key(layer)).unwrap();
         w_gate.dot(x_row)
     } else {
-        let w_up = weights.tensors.get(&arch.ffn_up_key(layer)).unwrap();
+        let w_up = weights.get_tensor_or_decode(&arch.ffn_up_key(layer)).unwrap();
         let mut p = w_up.dot(x_row);
         if let Some(bias) = arch
             .ffn_up_bias_key(layer)

@@ -9,7 +9,7 @@ use super::ple::apply_per_layer_embedding;
 use crate::attention::{AttentionWeights, SharedKV};
 use crate::ffn::FfnBackend;
 use crate::residual::rms_norm_for_arch;
-use larql_models::{ModelWeights, WeightsView};
+use larql_models::{DequantScratch, ModelWeights, WeightsView};
 use ndarray::Array2;
 
 /// Public wrapper for run_attention — used by diagnostic/capture tooling.
@@ -155,13 +155,27 @@ pub fn run_layer_with_ffn(
     ple_input: Option<&Array2<f32>>,
     shared_kv: Option<&SharedKV>,
 ) -> Option<(Array2<f32>, Option<Array2<f32>>, Option<SharedKV>)> {
+    let mut scratch = DequantScratch::new();
+    let canonical = weights.canonical();
+    canonical.load_layer_tensors_into_scratch(layer, &mut scratch);
+    let view = if scratch.is_empty() {
+        weights
+    } else {
+        WeightsView::with_scratch(canonical, &scratch)
+    };
+    let ffn_to_use = if ffn.name() == "weights" || ffn.name() == "view" {
+        &crate::ffn::ViewFfn { view } as &dyn FfnBackend
+    } else {
+        ffn
+    };
+
     let (h_post_attn, kv_out) = if shared_kv.is_some() {
         (
-            run_attention_inner(weights, h, layer, false, shared_kv)?.0,
+            run_attention_inner(view, h, layer, false, shared_kv)?.0,
             None,
         )
     } else {
-        let (h_pa, kv) = run_attention_with_kv_cache(weights, h, layer)?;
+        let (h_pa, kv) = run_attention_with_kv_cache(view, h, layer)?;
         (h_pa, Some(kv))
     };
     // Diagnostic: per-layer `h_post_attn` dump, paired with Metal's
@@ -175,9 +189,14 @@ pub fn run_layer_with_ffn(
         let path = crate::forward::dump_config::cpu_layer_h_post_attn_path(dir, layer);
         let _ = std::fs::write(&path, &bytes);
     }
-    let (h_post_ffn, activation) = run_ffn(&weights, &h_post_attn, layer, ffn, capture_activation);
-    let mut h_out = apply_per_layer_embedding(&weights, &h_post_ffn, layer, ple_input);
-    apply_layer_scalar(&weights, &mut h_out, layer);
+    let (h_post_ffn, activation) = run_ffn(&view, &h_post_attn, layer, ffn_to_use, capture_activation);
+    let mut h_out = apply_per_layer_embedding(&view, &h_post_ffn, layer, ple_input);
+    apply_layer_scalar(&view, &mut h_out, layer);
+
+    if !scratch.is_empty() {
+        canonical.evict_layer_pages(layer);
+    }
+
     Some((h_out, activation, kv_out))
 }
 
@@ -241,14 +260,28 @@ pub fn run_layer_with_capture_hooked(
 )> {
     hook.on_pre_layer(layer, h);
 
+    let mut scratch = DequantScratch::new();
+    let canonical = weights.canonical();
+    canonical.load_layer_tensors_into_scratch(layer, &mut scratch);
+    let view = if scratch.is_empty() {
+        weights
+    } else {
+        WeightsView::with_scratch(canonical, &scratch)
+    };
+    let ffn_to_use = if ffn.name() == "weights" || ffn.name() == "view" {
+        &crate::ffn::ViewFfn { view } as &dyn FfnBackend
+    } else {
+        ffn
+    };
+
     let (mut h_post_attn, attn_weights, kv_out) = if shared_kv.is_some() {
         let (h_post_attn, attn_weights) =
-            run_attention_inner(weights, h, layer, capture_attention, shared_kv)?;
+            run_attention_inner(view, h, layer, capture_attention, shared_kv)?;
         (h_post_attn, attn_weights, None)
     } else {
         let (h_post_attn, _, attn_weights, k_rope, v_final) =
             crate::attention::run_attention_block_with_kv_out(
-                weights,
+                view,
                 h,
                 layer,
                 capture_attention,
@@ -261,14 +294,18 @@ pub fn run_layer_with_capture_hooked(
     }
     hook.on_post_attention(layer, &mut h_post_attn);
 
-    let (h_post_ffn, activation) = run_ffn(&weights, &h_post_attn, layer, ffn, capture_activation);
+    let (h_post_ffn, activation) = run_ffn(&view, &h_post_attn, layer, ffn_to_use, capture_activation);
     if let Some(ref act) = activation {
         hook.on_ffn_activation(layer, act);
     }
 
-    let mut h_out = apply_per_layer_embedding(&weights, &h_post_ffn, layer, ple_input);
-    apply_layer_scalar(&weights, &mut h_out, layer);
+    let mut h_out = apply_per_layer_embedding(&view, &h_post_ffn, layer, ple_input);
+    apply_layer_scalar(&view, &mut h_out, layer);
     hook.on_post_layer(layer, &mut h_out);
+
+    if !scratch.is_empty() {
+        canonical.evict_layer_pages(layer);
+    }
 
     Some((h_out, activation, attn_weights, kv_out))
 }
