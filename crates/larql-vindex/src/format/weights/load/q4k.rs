@@ -250,7 +250,6 @@ pub fn load_model_weights_kquant_shard(
         skipped_tensors: Vec::new(),
         packed_mmaps,
         packed_byte_ranges,
-        layer_tensors_manifest: std::collections::HashMap::new(),
         embed,
         lm_head,
         position_embed: None,

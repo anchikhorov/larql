@@ -141,8 +141,6 @@ pub struct ModelConfig {
     pub global_head_dim: Option<usize>,
     /// Number of KV heads for global attention layers. If None, all layers use num_kv_heads.
     pub num_global_kv_heads: Option<usize>,
-    /// Number of Q heads for global attention layers. If None, all layers use num_q_heads.
-    pub num_global_q_heads: Option<usize>,
     /// Fraction of head_dim dimensions to apply RoPE to (0.0–1.0). If None, full rotation.
     pub partial_rotary_factor: Option<f64>,
     /// Sliding window pattern: every Nth layer is full attention.
@@ -856,14 +854,6 @@ pub trait ModelArchitecture: Send + Sync {
     /// `Gemma3TextConfig.rope_scaling.full_attention` structure.
     fn rope_position_divisor_for_layer(&self, _layer: usize) -> f64 {
         1.0
-    }
-
-    /// Returns true if this layer uses proportional RoPE frequency scaling
-    /// (where inverse frequencies are scaled by the full `head_dim` rather
-    /// than the reduced `rotary_dim` under a partial rotary fraction).
-    /// Used by Gemma 4 global layers.
-    fn rope_proportional_scaling_for_layer(&self, _layer: usize) -> bool {
-        false
     }
 
     /// `llama3` RoPE scaling parameters when the architecture uses them.

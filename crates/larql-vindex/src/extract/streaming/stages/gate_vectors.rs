@@ -179,23 +179,22 @@ impl<'a> StreamingContext<'a> {
                 //    experts/layer would otherwise produce 100s of GB).
                 let summary_k = self.summary_features_per_expert;
 
-                let mut total_features = 0usize;
-                let mut layer_bytes = 0u64;
-                let mut features_per_expert = 0usize;
+                // Phase 1: Read all expert gate tensors (sequential mmap reads).
+                let expert_tensors: Vec<(usize, ndarray::Array2<f32>)> = (0..self.n_experts)
+                    .filter_map(|expert| {
+                        let gate_key = self.arch.expert_ffn_gate_key(layer, expert)?;
+                        let key = normalize_key(&gate_key, &prefixes);
+                        let tensor = self.tensor_source.get_tensor_f32(&key).ok()??;
+                        Some((expert, tensor))
+                    })
+                    .collect();
 
-                for expert in 0..self.n_experts {
-                    let gate_key = match self.arch.expert_ffn_gate_key(layer, expert) {
-                        Some(k) => normalize_key(&k, &prefixes),
-                        None => continue,
-                    };
-
-                    if let Some(tensor) = self.tensor_source.get_tensor_f32(&gate_key)? {
-                        let data: Vec<f32>;
-                        let n_feat: usize;
+                // Phase 2: Compute gate data in parallel — SVD is the expensive part.
+                use rayon::prelude::*;
+                let expert_data: Vec<(usize, Vec<f32>, usize)> = expert_tensors
+                    .into_par_iter()
+                    .map(|(expert, tensor)| {
                         if summary_k > 0 && tensor.shape()[0] > summary_k {
-                            // SVD-summary path: top-K right singular vectors.
-                            // Seed with (layer, expert) so re-runs are
-                            // bit-identical but per-expert uncorrelated.
                             let seed = ((layer as u64) << 32) | (expert as u64);
                             let vt = crate::extract::moe_svd::top_k_right_singular_vectors(
                                 tensor.view(),
@@ -203,17 +202,22 @@ impl<'a> StreamingContext<'a> {
                                 /*p_iters=*/ 4,
                                 seed,
                             );
-                            n_feat = summary_k;
-                            data = vt.as_slice().unwrap().to_vec();
+                            (expert, vt.as_slice().unwrap().to_vec(), summary_k)
                         } else {
-                            // Full-matrix path: original behaviour.
-                            n_feat = tensor.shape()[0];
-                            data = tensor.as_slice().unwrap().to_vec();
+                            (expert, tensor.as_slice().unwrap().to_vec(), tensor.shape()[0])
                         }
-                        features_per_expert = n_feat;
-                        total_features += n_feat;
-                        layer_bytes += write_floats(&mut gate_file, &data, self.dtype)?;
-                    }
+                    })
+                    .collect();
+
+                // Phase 3: Sequential write.
+                let mut total_features = 0usize;
+                let mut layer_bytes = 0u64;
+                let mut features_per_expert = 0usize;
+
+                for (_expert, data, n_feat) in expert_data {
+                    features_per_expert = n_feat;
+                    total_features += n_feat;
+                    layer_bytes += write_floats(&mut gate_file, &data, self.dtype)?;
                 }
 
                 if total_features > 0 {

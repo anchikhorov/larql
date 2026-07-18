@@ -532,35 +532,25 @@ fn run_gguf_to_vindex(
         } else {
             None
         }
-    }).or_else(|| reconstruct_tokenizer_from_gguf(&gguf.metadata).ok());
+    });
 
     let tokenizer_ref = tokenizer
         .as_ref()
-        .ok_or("tokenizer.json not found next to GGUF file, and GGUF metadata fallback failed.")?;
-
-    // Compute model summary from GGUF metadata for the display line.
-    // Avoids loading all tensors just for the summary.
-    let cfg_json = gguf.to_config_json();
-    let num_layers = cfg_json["num_hidden_layers"].as_u64().unwrap_or(0);
-    let hidden_size = cfg_json["hidden_size"].as_u64().unwrap_or(0);
-    let intermediate_size = cfg_json["intermediate_size"].as_u64().unwrap_or(0);
-    let vocab_size = cfg_json["vocab_size"].as_u64().unwrap_or(0);
-    eprintln!(
-        "  {} layers, hidden_size={}, intermediate_size={}, vocab_size={}",
-        num_layers, hidden_size, intermediate_size, vocab_size,
-    );
+        .ok_or("tokenizer.json not found next to GGUF file. Place it in the same directory.")?;
 
     eprintln!("\nExtracting to {}", output.display());
 
-    if dense_only || do_keep_quant {
-        // Eager path: BitNet --dense-only or --keep-quant needs the full
-        // ModelWeights in RAM (the bitnet_writer consumes raw_bytes).
-        // TODO: streaming BitNet writer — requires I2_S raw bytes via mmap.
-        if dense_only {
-            eprintln!(
-                "  Dense-only build: skipping gate-vector + clustering stages \
-                 (walk / browse disabled; native-ternary /v1/infer only)"
-            );
+    let mut callbacks = SilentCallbacks;
+
+    // BitNet --keep-quant and --dense-only require the in-memory loader
+    // (special writer subsystems that touch ModelWeights directly).
+    // All other GGUF conversions use the streaming pipeline — no full
+    // model in RAM, peak memory is one tensor at a time.
+    if do_keep_quant || dense_only {
+        if do_keep_quant {
+            eprintln!("  Loading and dequantizing tensors (BitNet keep-quant path)...");
+        } else {
+            eprintln!("  Loading and dequantizing tensors (dense-only path)...");
         }
         let weights = if do_keep_quant {
             const TYPE_I2_S: u32 = 36;
@@ -568,8 +558,17 @@ fn run_gguf_to_vindex(
         } else {
             larql_models::load_gguf(input)?
         };
-        let mut callbacks = SilentCallbacks;
+
+        eprintln!(
+            "  {} layers, hidden_size={}, intermediate_size={}, vocab_size={}",
+            weights.num_layers, weights.hidden_size, weights.intermediate_size, weights.vocab_size
+        );
+
         if dense_only {
+            eprintln!(
+                "  Dense-only build: skipping gate-vector + clustering stages \
+                 (walk / browse disabled; native-ternary /v1/infer only)"
+            );
             larql_vindex::build_vindex_dense_only(
                 &weights,
                 tokenizer_ref,
@@ -591,6 +590,8 @@ fn run_gguf_to_vindex(
             )?;
         }
 
+        // BitNet --keep-quant: write the I2_S bytes + per-channel scales
+        // and stamp `bitnet_layout` into index.json.
         if do_keep_quant {
             let arch_get_u32 = |k: &str| {
                 gguf.metadata
@@ -616,7 +617,9 @@ fn run_gguf_to_vindex(
                 arch.rope_base = r;
             }
             let layout = larql_vindex::extract::bitnet_writer::write_bitnet_artifacts(
-                output, &weights, arch,
+                output,
+                &weights,
+                arch,
             )?;
             eprintln!(
                 "  BitNet keep-quant: wrote {} I2_S tensors + {} scale entries \
@@ -632,20 +635,32 @@ fn run_gguf_to_vindex(
             patch_index_json_with_bitnet_layout(output, &layout)?;
         }
     } else {
-        // Streaming path: mmap GGUF shards, process one layer at a time.
-        // Peak RSS = embeddings + one tensor — safe for >RAM models.
-        let mut callbacks = SilentCallbacks;
+        // Streaming path: mmap the GGUF and extract layer-by-layer.
+        // Peak memory is ~1 layer's tensors, not the full model.
+        eprintln!(
+            "  Streaming extraction: mmap'd GGUF, no full model in RAM"
+        );
+
+        let weight_opts = larql_vindex::WriteWeightsOptions {
+            level: extract_level,
+            ffn_compact: false,
+            skip_attn: false,
+            skip_ffn: false,
+        };
+
+        // Point build_vindex_streaming at the GGUF file directly —
+        // detect_gguf_entry handles both single files and directories.
         larql_vindex::build_vindex_streaming(
             input,
             tokenizer_ref,
             &model_name,
             output,
-            10, // down_top_k
-            0,  // summary_features_per_expert (no CLI flag for this)
+            10,    // down_top_k
+            0,     // summary_features_per_expert
             extract_level,
             dtype,
             larql_vindex::QuantFormat::None,
-            larql_vindex::WriteWeightsOptions::default(),
+            weight_opts,
             larql_vindex::KquantWriteOptions::default(),
             false, // drop_gate_vectors
             &mut callbacks,
@@ -671,7 +686,15 @@ fn run_safetensors_to_vindex(
     level: &str,
     use_f16: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("Converting safetensors: {}", input.display());
+    // This is essentially extract-index
+    eprintln!("Loading safetensors: {}", input.display());
+    let weights = larql_models::load_model_dir(input)?;
+    let tokenizer = larql_vindex::load_vindex_tokenizer(input).or_else(|_| {
+        // Try to load from the model directory
+        let tok_path = input.join(TOKENIZER_JSON);
+        larql_vindex::tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| larql_vindex::VindexError::Parse(e.to_string()))
+    })?;
 
     let extract_level = match level {
         "inference" => larql_vindex::ExtractLevel::Inference,
@@ -690,31 +713,22 @@ fn run_safetensors_to_vindex(
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "model".into());
 
-    let tokenizer = larql_vindex::load_vindex_tokenizer(input).or_else(|_| {
-        let tok_path = input.join(TOKENIZER_JSON);
-        larql_vindex::tokenizers::Tokenizer::from_file(&tok_path)
-            .map_err(|e| larql_vindex::VindexError::Parse(e.to_string()))
-    })?;
-
     eprintln!("Extracting to {}", output.display());
 
     let mut callbacks = SilentCallbacks;
-    larql_vindex::build_vindex_streaming(
-        input,
+    larql_vindex::build_vindex(
+        &weights,
         &tokenizer,
         &model_name,
         output,
         10,
-        0,
         extract_level,
         dtype,
-        larql_vindex::QuantFormat::None,
-        larql_vindex::WriteWeightsOptions::default(),
-        larql_vindex::KquantWriteOptions::default(),
-        false,
         &mut callbacks,
     )?;
-
+    // Snapshot HF-side metadata (chat template, special tokens, generation
+    // config) from the source directory. `input` here is the safetensors
+    // model dir, which is where these files live in the HF cache.
     if let Err(e) = larql_vindex::snapshot_hf_metadata(input, output) {
         eprintln!("  warning: failed to snapshot HF metadata: {e}");
     }
@@ -798,53 +812,4 @@ fn patch_index_json_with_bitnet_layout(
     let json = serde_json::to_string_pretty(&config)?;
     std::fs::write(&path, json)?;
     Ok(())
-}
-
-fn reconstruct_tokenizer_from_gguf(
-    metadata: &std::collections::HashMap<String, larql_models::loading::gguf::GgufValue>,
-) -> Result<larql_vindex::tokenizers::Tokenizer, Box<dyn std::error::Error + Send + Sync>> {
-    let tokens_val = metadata.get("tokenizer.ggml.tokens")
-        .ok_or("tokenizer.ggml.tokens not found in GGUF metadata")?;
-    
-    let tokens = match tokens_val {
-        larql_models::loading::gguf::GgufValue::Array(arr) => arr,
-        _ => return Err("tokenizer.ggml.tokens is not an array".into()),
-    };
-
-    let mut vocab = serde_json::Map::new();
-    for (i, val) in tokens.iter().enumerate() {
-        if let Some(s) = val.as_str() {
-            vocab.insert(s.to_string(), serde_json::Value::Number(serde_json::Number::from(i)));
-        }
-    }
-
-    // Default to a WordLevel tokenizer to satisfy the struct requirements.
-    // If we need merges for BPE, we extract them too.
-    let mut model = serde_json::json!({
-        "type": "WordLevel",
-        "vocab": vocab,
-    });
-
-    if let Some(larql_models::loading::gguf::GgufValue::Array(merges_arr)) = metadata.get("tokenizer.ggml.merges") {
-        let mut merges = Vec::new();
-        for val in merges_arr {
-            if let Some(s) = val.as_str() {
-                merges.push(s.to_string());
-            }
-        }
-        model = serde_json::json!({
-            "type": "BPE",
-            "vocab": vocab,
-            "merges": merges,
-        });
-    }
-
-    let tok_json = serde_json::json!({
-        "version": "1.0",
-        "model": model,
-    });
-
-    let tok_str = tok_json.to_string();
-    let tokenizer = tok_str.parse::<larql_vindex::tokenizers::Tokenizer>()?;
-    Ok(tokenizer)
 }

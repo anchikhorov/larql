@@ -129,12 +129,11 @@ impl ModelArchitecture for Gemma4Arch {
         }
     }
 
-    fn num_q_heads_for_layer(&self, layer: usize) -> usize {
-        if self.is_global_layer(layer) {
-            self.config.num_global_q_heads.unwrap_or(self.config.num_q_heads)
-        } else {
-            self.config.num_q_heads
-        }
+    fn num_q_heads_for_layer(&self, _layer: usize) -> usize {
+        // Gemma 4 keeps num_q_heads constant across all layers.
+        // At global layers, each head uses global_head_dim instead of head_dim,
+        // so Q projection output is larger (num_q * global_head_dim).
+        self.config.num_q_heads
     }
 
     fn rotary_fraction_for_layer(&self, layer: usize) -> f64 {
@@ -160,6 +159,15 @@ impl ModelArchitecture for Gemma4Arch {
         self.kv_sources.get(layer).copied().flatten()
     }
 
+    // Gemma 4 uses QK-norm which already normalizes dot products.
+    // No additional 1/sqrt(head_dim) scaling is applied (scaling = 1.0).
+    fn attention_scale(&self) -> f64 {
+        1.0
+    }
+
+    fn attention_scale_for_layer(&self, _layer: usize) -> f64 {
+        1.0
+    }
 
     fn layer_scalar_key(&self, layer: usize) -> Option<String> {
         Some(format!("{}layer_scalar", self.layer_prefix(layer)))
@@ -222,10 +230,6 @@ impl ModelArchitecture for Gemma4Arch {
         } else {
             self.config.rope_base
         }
-    }
-
-    fn rope_proportional_scaling_for_layer(&self, layer: usize) -> bool {
-        self.is_global_layer(layer)
     }
 
     // ── Hybrid MoE (26B A4B: dense MLP + expert block, outputs summed) ──

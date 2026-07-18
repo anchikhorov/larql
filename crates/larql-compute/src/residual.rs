@@ -119,47 +119,6 @@ pub fn layer_norm_eps(
     out
 }
 
-/// Resolve a `(num_heads, head_dim)` pair that exactly tiles `cols` columns.
-///
-/// Prefers the caller's `num_heads * head_dim`, but falls back to the actual
-/// tensor width so a per-layer geometry mismatch (e.g. Gemma 4 sliding
-/// `head_dim=256` vs global `global_head_dim=512`) can **never** index out of
-/// bounds in the per-head norm loops. The caller's geometry being wrong is a
-/// real bug upstream (extraction wrote the wrong-width tensor, or config
-/// `global_head_dim`/`num_global_kv_heads` didn't parse) — we surface it as a
-/// warning rather than a panic, then proceed with the geometry the data
-/// actually has. Without this, the raw `x[[s, off + d]]` index in the norm
-/// loop is an out-of-bounds read (unsound, not just incorrect).
-fn resolve_head_geometry(cols: usize, num_heads: usize, head_dim: usize) -> (usize, usize) {
-    if num_heads != 0 && head_dim != 0 && num_heads * head_dim == cols {
-        return (num_heads, head_dim);
-    }
-    if num_heads != 0 && cols % num_heads == 0 {
-        let hd = cols / num_heads;
-        eprintln!(
-            "WARN: rms_norm_heads geometry mismatch (expected num_heads*head_dim={} != cols={}); \
-             deriving head_dim={hd} from tensor width",
-            num_heads * head_dim, cols
-        );
-        return (num_heads, hd);
-    }
-    if head_dim != 0 && cols % head_dim == 0 {
-        let nh = cols / head_dim;
-        eprintln!(
-            "WARN: rms_norm_heads geometry mismatch (expected num_heads*head_dim={} != cols={}); \
-             deriving num_heads={nh} from tensor width",
-            num_heads * head_dim, cols
-        );
-        return (nh, head_dim);
-    }
-    eprintln!(
-        "WARN: rms_norm_heads geometry mismatch (expected num_heads*head_dim={} != cols={}); \
-         falling back to a single head spanning the row",
-        num_heads * head_dim, cols
-    );
-    (1, cols)
-}
-
 /// Per-head RMS norm without learned weights (parameter-free normalization).
 /// Used for V-norm in Gemma 4: just normalizes, no scaling.
 pub fn rms_norm_heads_no_weight(x: &Array2<f32>, num_heads: usize, head_dim: usize) -> Array2<f32> {
@@ -174,7 +133,6 @@ pub fn rms_norm_heads_no_weight_eps(
     eps: f64,
 ) -> Array2<f32> {
     let seq_len = x.shape()[0];
-    let (num_heads, head_dim) = resolve_head_geometry(x.shape()[1], num_heads, head_dim);
     let mut out = x.clone();
 
     for s in 0..seq_len {
@@ -216,22 +174,6 @@ pub fn rms_norm_heads_eps(
     eps: f64,
 ) -> Array2<f32> {
     let seq_len = x.shape()[0];
-    let cols = x.shape()[1];
-    // For weighted per-head norms the QK-norm weight is per-head, so its
-    // length is the authoritative head_dim. Fall back to the tensor width
-    // when the weight is absent/empty. Never lets `weight[d]` or the
-    // `x[[s, off + d]]` index run out of bounds.
-    let (num_heads, head_dim) = if !weight.is_empty() {
-        let hd = weight.len();
-        let nh = if hd != 0 && cols % hd == 0 {
-            cols / hd
-        } else {
-            num_heads
-        };
-        (nh, hd)
-    } else {
-        resolve_head_geometry(cols, num_heads, head_dim)
-    };
     let mut out = x.clone();
 
     for s in 0..seq_len {
@@ -443,33 +385,5 @@ mod tests {
             max_diff > 0.01,
             "rms_norm_heads_no_weight_eps did not honour explicit eps (max diff {max_diff})"
         );
-    }
-
-    // ── Geometry-mismatch resilience (Gemma 4 dual head_dim regression) ──
-
-    #[test]
-    fn rms_norm_heads_no_weight_survives_wider_geometry() {
-        // Regression for the INFER `ndarray: index out of bounds` crash on
-        // Gemma 4 global layers: caller reports a wider head geometry
-        // (global_head_dim=8) than the tensor actually has (4 cols, i.e.
-        // the sliding width). Without the resolve_head_geometry guard this
-        // indexes out of bounds. It must instead derive head_dim from the
-        // tensor width and stay in-bounds.
-        let x = Array2::from_shape_vec((1, 4), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let out = rms_norm_heads_no_weight(&x, /*num_heads=*/ 1, /*head_dim=*/ 8);
-        assert_eq!(out.shape(), &[1, 4]);
-        assert!(out.iter().all(|v| v.is_finite()));
-    }
-
-    #[test]
-    fn rms_norm_heads_weighted_survives_wider_geometry() {
-        // Weighted variant: the QK-norm weight length is the authoritative
-        // head_dim. A mismatched caller geometry must not OOB on either the
-        // `weight[d]` index or the tensor index.
-        let x = Array2::from_shape_vec((1, 4), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
-        let w = vec![0.0; 4]; // per-head QK-norm weight, length 4
-        let out = rms_norm_heads(&x, &w, /*num_heads=*/ 1, /*head_dim=*/ 8, 0.0);
-        assert_eq!(out.shape(), &[1, 4]);
-        assert!(out.iter().all(|v| v.is_finite()));
     }
 }

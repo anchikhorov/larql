@@ -286,45 +286,17 @@ impl VectorIndex {
                     }
                 }
                 crate::config::dtype::StorageDtype::F16 => {
-                    // Double-checked locking: quick peek under the lock,
-                    // expensive decode outside the lock, quick insert under
-                    // the lock.  Multiple workers can hit a cold cache
-                    // simultaneously — the second lock+get_or_insert_with
-                    // deduplicates the insert (one worker's decode wins,
-                    // the other's is dropped).  Transient duplicate work
-                    // is bounded by the first batch of parallel HNSW
-                    // warmup calls and does not affect steady state.
-                    let decoded = {
-                        let mut cache = self.gate.f16_decode_cache.lock().unwrap();
-                        if cache.len() <= layer {
-                            cache.resize(layer + 1, None);
-                        }
-                        let hit = cache[layer].is_some();
-                        let data = if hit {
-                            cache[layer].as_ref().unwrap().clone()
-                        } else {
-                            Vec::new()
-                        };
-                        self.touch_gate_cache_lru(layer, false, &mut cache);
-                        if hit { Some(data) } else { None }
-                    };
-                    let data = match decoded {
-                        Some(d) => d,
-                        None => {
-                            let raw = &mmap[byte_offset..byte_end];
-                            let decoded = larql_models::quant::half::decode_f16(raw);
-                            let mut cache = self.gate.f16_decode_cache.lock().unwrap();
-                            if cache.len() <= layer {
-                                cache.resize(layer + 1, None);
-                            }
-                            let data = cache[layer]
-                                .get_or_insert_with(|| decoded)
-                                .clone();
-                            self.touch_gate_cache_lru(layer, true, &mut cache);
-                            data
-                        }
-                    };
-                    data
+                    let mut cache = self.gate.f16_decode_cache.lock().unwrap();
+                    if cache.len() <= layer {
+                        cache.resize(layer + 1, None);
+                    }
+                    let miss = cache[layer].is_none();
+                    if miss {
+                        let raw = &mmap[byte_offset..byte_end];
+                        cache[layer] = Some(larql_models::quant::half::decode_f16(raw));
+                    }
+                    self.touch_gate_cache_lru(layer, miss, &mut cache);
+                    cache[layer].as_ref().unwrap().clone()
                 }
             };
             return Some(GateData {

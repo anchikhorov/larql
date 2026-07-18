@@ -26,7 +26,7 @@ use crate::config::types::VindexConfig;
 use crate::error::VindexError;
 use crate::format::filenames::*;
 use crate::format::weights::{
-    load_model_weights_with_opts, write_model_weights_kquant_with_opts, KquantWriteOptions,
+    load_model_weights, write_model_weights_kquant_with_opts, KquantWriteOptions,
 };
 use crate::index::storage::ffn_store::{FFN_COMPONENTS_PER_LAYER, FFN_DOWN};
 use crate::IndexLoadCallbacks;
@@ -128,14 +128,7 @@ pub fn vindex_to_q4k(
     // the same ModelWeights shape `write_model_weights_kquant_with_opts`
     // consumes.
     let mut cb = SilentCallbacks;
-    let weights = load_model_weights_with_opts(
-        src,
-        &mut cb as &mut dyn IndexLoadCallbacks,
-        crate::LoadWeightsOptions {
-            eager_load_layers: true,
-            ..Default::default()
-        },
-    )?;
+    let weights = load_model_weights(src, &mut cb as &mut dyn IndexLoadCallbacks)?;
 
     // Seed the staging dir with the source's index.json. The Q4K writer
     // reads dir/index.json to update it in-place (sets has_model_weights

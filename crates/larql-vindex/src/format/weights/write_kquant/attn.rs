@@ -3,6 +3,7 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use rayon::prelude::*;
 use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
 
 use crate::error::VindexError;
@@ -50,42 +51,42 @@ pub(super) fn write_attn_weights_kquant(
         // Q, K, V, O in that order — use the same key string for V even when
         // the data is K's, so loaders that look up by position still work.
         #[allow(clippy::type_complexity)]
-        let slots: [(&str, Option<(Vec<f32>, usize, usize)>); 4] = [
-            (q_key.as_str(), q),
-            (k_key.as_str(), k),
-            (v_key.as_str(), v),
-            (o_key.as_str(), o),
+        let slots: [(String, Option<(Vec<f32>, usize, usize)>); 4] = [
+            (q_key, q),
+            (k_key, k),
+            (v_key, v),
+            (o_key, o),
         ];
 
-        for (i, (key, tensor)) in slots.iter().enumerate() {
-            let (data, rows, cols) = match tensor {
-                Some(t) => t.clone(),
-                None => continue, // tensor genuinely absent — skip
-            };
+        // Quantize Q/K/V/O in parallel — each is an independent tensor
+        // that pads and quantizes to Q4_K (or Q6_K for V) without shared state.
+        let quantized: Vec<(String, Vec<u8>, usize, usize, QuantBlockFormat)> = slots
+            .into_par_iter()
+            .enumerate()
+            .filter_map(|(i, (key, tensor))| {
+                let (data, rows, cols) = tensor?;
+                let is_v = i == 2;
+                let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
+                let q_bytes = if is_v {
+                    quantize_q6_k(&padded)
+                } else {
+                    quantize_q4_k(&padded)
+                };
+                let format = if is_v {
+                    QuantBlockFormat::Q6K
+                } else {
+                    QuantBlockFormat::Q4K
+                };
+                Some((key, q_bytes, rows, padded_cols, format))
+            })
+            .collect();
 
-            // V (index 2) gets Q6_K, others get Q4_K.
-            let is_v = i == 2;
-            // Row-pad to 256 so each row aligns to a super-block boundary.
-            // Critical for models with non-256 inner dims (e.g. Gemma 4 26B A4B
-            // where the dense intermediate is 2112). `padded_cols` is what the
-            // matvec shader must use as `K`; callers also need to zero-pad the
-            // input vector to the same width.
-            let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
-            let q_bytes = if is_v {
-                quantize_q6_k(&padded)
-            } else {
-                quantize_q4_k(&padded)
-            };
-            let format = if is_v {
-                QuantBlockFormat::Q6K
-            } else {
-                QuantBlockFormat::Q4K
-            };
-
+        // Sequential write — single BufWriter with running offset.
+        for (key, q_bytes, rows, padded_cols, format) in quantized {
             attn_file.write_all(&q_bytes)?;
             let length = q_bytes.len() as u64;
             attn_manifest.push(Q4kManifestEntry {
-                key: key.to_string(),
+                key,
                 shape: vec![rows, padded_cols],
                 format,
                 offset: attn_offset,

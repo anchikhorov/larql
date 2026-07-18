@@ -376,22 +376,20 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         // Dispatch:
         //
-        //  - Safetensors (always) and GGUF at browse level go through the
-        //    streaming pipeline — no full model in RAM.
-        //  - GGUF at inference / attention / all levels (or any level
-        //    with `--quant q4k`) still hits the in-memory loader: the
-        //    `StreamingWeights` writer subsystem is safetensors-only,
-        //    and porting it to GGUF is a follow-on PR.
-        let route_gguf_through_streaming = is_gguf_source
-            && matches!(level, larql_vindex::ExtractLevel::Browse)
-            && args.quant == larql_vindex::QuantFormat::None;
+        //  All GGUF and safetensors sources go through the streaming
+        //  pipeline — no full model in RAM. Peak memory is one tensor
+        //  at a time. The `GgufWeightSource` in `tensor_io.rs` reads
+        //  GGUF tensors on demand via mmap + dequantize; for safetensors
+        //  the existing `StreamingWeights` handles sharded reads.
+        //
+        //  The old in-memory GGUF path (which loaded every tensor to
+        //  f32 in RAM) has been eliminated — even Q4K-quantized builds
+        //  now work through the streaming writer via `GgufWeightSource`.
+        let route_gguf_through_streaming = is_gguf_source;
 
         if is_gguf_source && !route_gguf_through_streaming {
-            // GGUF + attention/inference/all (or any level with q4k) →
-            // in-memory loader. `load_model_dir_validated` auto-detects
-            // GGUF (single file or directory containing one) and
-            // dequantises tensors to f32, producing the `ModelWeights`
-            // shape the in-memory build path expects.
+            // Unreachable: route_gguf_through_streaming is always true
+            // for GGUF sources. Kept as a dead-code safety valve.
             let load_target: std::path::PathBuf = if let Some(gguf) = gguf_dir {
                 gguf
             } else {
@@ -438,10 +436,10 @@ pub fn run(args: ExtractIndexArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
-            // Safetensors path (any level) OR GGUF at browse level —
-            // streaming mmap, no full model load. For GGUF, point the
-            // pipeline at the shard-1 file (or the directory; the
-            // pipeline picks the right shard internally).
+            // Streaming path: mmap-based, no full model load.
+            // For GGUF, point the pipeline at the shard-1 file (or the
+            // directory; the pipeline picks the right shard internally).
+            // For safetensors, point at the model directory.
             let streaming_entry: std::path::PathBuf = if let Some(gguf) = gguf_dir.as_ref() {
                 gguf.clone()
             } else {

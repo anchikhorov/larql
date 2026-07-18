@@ -320,7 +320,6 @@ fn run_attention_block_core(
     let num_q = arch.num_q_heads_for_layer(layer);
     let num_kv = arch.num_kv_heads_for_layer(layer);
     let reps = num_q / num_kv;
-
     let scale = if arch.attention_multiplier() != 1.0 {
         arch.attention_multiplier() as f64
     } else {
@@ -360,15 +359,6 @@ fn run_attention_block_core(
     }
     dump_f32("q_out_raw", &q_full);
 
-    // STRICT VALIDATION: Q tensor cols must equal num_q * head_dim.
-    // A mismatch means config metadata (global_head_dim, num_global_q_heads)
-    // disagrees with the extracted tensor — crash loudly, never reshape.
-    if q_full.shape()[1] != num_q * head_dim {
-        panic!("ERROR: layer {layer}: Q tensor cols {} != num_q ({}) * head_dim ({}) — config/extraction geometry mismatch.",
-               q_full.shape()[1], num_q, head_dim);
-    }
-    let q_head_dim = head_dim;
-
     // QK norm on Q
     let qk_offset = weights.arch.qk_norm_weight_offset();
     let qk_norm_off = if qk_offset != 0.0 {
@@ -380,7 +370,7 @@ fn run_attention_block_core(
         .attn_q_norm_key(layer)
         .and_then(|k| weights.vectors.get(&k))
     {
-        Some(norm_w) => rms_norm_heads(&q_full, norm_w, num_q, q_head_dim, qk_norm_off),
+        Some(norm_w) => rms_norm_heads(&q_full, norm_w, num_q, head_dim, qk_norm_off),
         None => q_full,
     };
     dump_f32("q_out_after_qk_norm", &q_normed);
@@ -394,33 +384,21 @@ fn run_attention_block_core(
     let q_rope = crate::attention::rope::apply_rope_partial_at_full(
         &q_normed,
         num_q,
-        q_head_dim,
+        head_dim,
         layer_rope_base,
         rotary_frac,
         0,
         pos_divisor,
         llama3,
-        arch.rope_proportional_scaling_for_layer(layer),
     );
 
-    // K/V: either from shared cache or computed fresh.
-    let kv_head_dim = head_dim;
+    // K/V: either from shared cache or computed fresh
     let (k_rope, v_final) = if let Some((cached_k, cached_v)) = shared_kv {
-        // STRICT VALIDATION for cached K tensor.
-        if cached_k.shape()[1] != num_kv * head_dim {
-            panic!("ERROR: layer {layer}: cached K tensor cols {} != num_kv ({}) * head_dim ({}) — config/extraction geometry mismatch.",
-                   cached_k.shape()[1], num_kv, head_dim);
-        }
         (cached_k.clone(), cached_v.clone())
     } else {
         let w_k = weights.tensor(&arch.attn_k_key(layer)).unwrap();
 
         let mut k_full = dot_proj(&h_norm, w_k);
-        // STRICT VALIDATION for fresh K tensor.
-        if k_full.shape()[1] != num_kv * head_dim {
-            panic!("ERROR: layer {layer}: K tensor cols {} != num_kv ({}) * head_dim ({}) — config/extraction geometry mismatch.",
-                   k_full.shape()[1], num_kv, head_dim);
-        }
         if let Some(bias) = arch
             .attn_k_bias_key(layer)
             .and_then(|k| weights.vectors.get(&k))
@@ -432,7 +410,7 @@ fn run_attention_block_core(
             .attn_k_norm_key(layer)
             .and_then(|k| weights.vectors.get(&k))
         {
-            Some(norm_w) => rms_norm_heads(&k_full, norm_w, num_kv, kv_head_dim, qk_norm_off),
+            Some(norm_w) => rms_norm_heads(&k_full, norm_w, num_kv, head_dim, qk_norm_off),
             None => k_full.clone(),
         };
 
@@ -459,11 +437,11 @@ fn run_attention_block_core(
                 add_bias(&mut v, bias);
             }
             if arch.has_v_norm() {
-                v = rms_norm_heads_no_weight(&v, num_kv, kv_head_dim);
+                v = rms_norm_heads_no_weight(&v, num_kv, head_dim);
             }
             v
         } else if arch.has_v_norm() {
-            rms_norm_heads_no_weight(&k_full, num_kv, kv_head_dim)
+            rms_norm_heads_no_weight(&k_full, num_kv, head_dim)
         } else {
             k_full.clone()
         };
@@ -471,13 +449,12 @@ fn run_attention_block_core(
         let k_r = crate::attention::rope::apply_rope_partial_at_full(
             &k_normed,
             num_kv,
-            kv_head_dim,
+            head_dim,
             layer_rope_base,
             rotary_frac,
             0,
             pos_divisor,
             llama3,
-            arch.rope_proportional_scaling_for_layer(layer),
         );
         (k_r, v_full)
     };
@@ -490,12 +467,12 @@ fn run_attention_block_core(
     let softcap = arch.attn_logit_softcapping();
     let reduced_qk_weights = reduced_qk_rank.map(|rank| {
         gqa_reduced_qk_all_weights(
-            &q_rope, &k_rope, num_q, kv_head_dim, reps, scale, seq_len, softcap, rank,
+            &q_rope, &k_rope, num_q, head_dim, reps, scale, seq_len, softcap, rank,
         )
     });
     let (mut attn_out, attn_weights, full_all_attn_weights) = if capture_all_attention {
         let (out, all_weights) = gqa_attention_with_all_weights(
-            &q_rope, &k_rope, &v_final, num_q, kv_head_dim, reps, scale, seq_len, softcap,
+            &q_rope, &k_rope, &v_final, num_q, head_dim, reps, scale, seq_len, softcap,
         );
         (out, None, Some(all_weights))
     } else {
@@ -504,7 +481,7 @@ fn run_attention_block_core(
             &k_rope,
             &v_final,
             num_q,
-            kv_head_dim,
+            head_dim,
             reps,
             scale,
             seq_len,
@@ -519,17 +496,17 @@ fn run_attention_block_core(
             if head >= num_q {
                 return None;
             }
-            let start = head * kv_head_dim;
-            let end = start + kv_head_dim;
+            let start = head * head_dim;
+            let end = start + head_dim;
             attn_out.slice_mut(s![.., start..end]).fill(0.0);
         }
     }
     if let Some((head, replacement)) = replace_pre_o_head {
-        if head >= num_q || replacement.nrows() != seq_len || replacement.ncols() != kv_head_dim {
+        if head >= num_q || replacement.nrows() != seq_len || replacement.ncols() != head_dim {
             return None;
         }
-        let start = head * kv_head_dim;
-        let end = start + kv_head_dim;
+        let start = head * head_dim;
+        let end = start + head_dim;
         attn_out
             .slice_mut(s![.., start..end])
             .assign(&replacement.view());
@@ -543,8 +520,8 @@ fn run_attention_block_core(
             if head >= num_q {
                 return None;
             }
-            let start = head * kv_head_dim;
-            let end = start + kv_head_dim;
+            let start = head * head_dim;
+            let end = start + head_dim;
             let head_out = attn_out.slice(s![.., start..end]);
             let w_o_head = w_o.slice(s![.., start..end]);
             let contribution = dot_proj(&head_out, &w_o_head);
@@ -558,8 +535,8 @@ fn run_attention_block_core(
         {
             return None;
         }
-        let start = head * kv_head_dim;
-        let end = start + kv_head_dim;
+        let start = head * head_dim;
+        let end = start + head_dim;
         let head_out = attn_out.slice(s![.., start..end]);
         let w_o_head = w_o.slice(s![.., start..end]);
         let original_contribution = dot_proj(&head_out, &w_o_head);
@@ -931,73 +908,6 @@ mod tests {
             None
         )
         .is_none());
-    }
-
-    // ── Gemma 4 dual-head_dim V-norm regression (INFER crash) ──
-
-    #[test]
-    fn gemma4_dual_geometry_forward_passes_all_layers() {
-        // Gemma 4 has dual head_dim: sliding layers use `head_dim` while
-        // global layers use `global_head_dim` (e.g. 256 vs 512). A full
-        // forward pass over every layer — including the global layers of
-        // the synthetic E2B-like fixture — must not panic on the per-head
-        // V-norm reshape in `run_attention_block_core` -> `rms_norm_heads_*`.
-        let weights = larql_models::test_fixtures::make_synthetic_e2b_like_weights();
-        let h = hidden(2, weights.hidden_size);
-        for layer in 0..weights.num_layers {
-            let out = crate::attention::run_attention_block_with_kv_out(
-                larql_models::WeightsView::dense(&weights),
-                &h,
-                layer,
-                false,
-                None,
-            );
-            assert!(out.is_some(), "gemma4 dual-geometry layer {layer} failed");
-            let (h_out, _, _, k, v) = out.unwrap();
-            assert!(h_out.iter().all(|x| x.is_finite()), "layer {layer}: non-finite h");
-            assert!(k.iter().all(|x| x.is_finite()), "layer {layer}: non-finite k");
-            assert!(v.iter().all(|x| x.is_finite()), "layer {layer}: non-finite v");
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "config/extraction geometry mismatch")]
-    fn gemma4_global_layer_vnorm_reuse_survives_geometry_mismatch() {
-        // Exact repro of the INFER `ndarray: index out of bounds` crash:
-        // a Gemma 4 global layer whose K projection was extracted at the
-        // WRONG (sliding) width while the arch reports the global head
-        // geometry, and whose V projection is absent — so V-norm must reuse
-        // K via the `block.rs:444` path. Without the resolve_head_geometry
-        // guard this indexes out of bounds.
-        let mut weights = larql_models::test_fixtures::make_synthetic_e2b_like_weights();
-        let global_layer = 1; // full_attention per the synthetic layer_types
-
-        // Corrupt the global layer's K projection to a width (4) that doesn't
-        // match the expected global K width (num_kv * head_dim = 1 * 8 = 8).
-        let k_key = weights.arch.attn_k_key(global_layer);
-        weights.tensors.insert(
-            k_key,
-            ndarray::Array2::<f32>::zeros((4, weights.hidden_size)).into_shared(),
-        );
-        // Remove the V projection so V-norm reuses K (block.rs:444 path).
-        let v_key = weights.arch.attn_v_key(global_layer);
-        weights.tensors.remove(&v_key);
-
-        let h = hidden(2, weights.hidden_size);
-        let out = crate::attention::run_attention_block_with_kv_out(
-            larql_models::WeightsView::dense(&weights),
-            &h,
-            global_layer,
-            false,
-            None,
-        );
-        // The deliberate K-tensor corruption (width=4 != num_kv * head_dim=8)
-        // triggers the strict validation guard, so the function returns None
-        // rather than OOB at V-norm reuse.
-        assert!(
-            out.is_none(),
-            "gemma4 global layer should return None on incompatible Q/K head dims"
-        );
     }
 
     // ── Gemma3-arch fixture (post-norms, QK norm, gelu_tanh) ───────────

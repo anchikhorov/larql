@@ -249,9 +249,6 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     let num_global_kv_heads = text_config["num_global_key_value_heads"]
         .as_u64()
         .map(|v| v as usize);
-    let num_global_q_heads = text_config["num_global_q_heads"]
-        .as_u64()
-        .map(|v| v as usize);
     // Partial rotary factor: check rope_parameters.full_attention first (Gemma 4),
     // then top-level partial_rotary_factor.
     let partial_rotary_factor = rope_params
@@ -317,7 +314,6 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         logits_scaling,
         global_head_dim,
         num_global_kv_heads,
-        num_global_q_heads,
         partial_rotary_factor,
         sliding_window_pattern,
         layer_types,

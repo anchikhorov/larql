@@ -109,7 +109,6 @@ pub fn apply_rope_partial_at_scaled(
         position_offset,
         position_divisor,
         None,
-        false,
     )
 }
 
@@ -128,16 +127,14 @@ pub fn apply_rope_partial_at_full(
     position_offset: usize,
     position_divisor: f64,
     llama3_scaling: Option<Llama3RopeScaling>,
-    proportional: bool,
 ) -> Array2<f32> {
     let seq_len = x.shape()[0];
     let mut out = x.clone();
 
     let rotary_dim = ((head_dim as f64 * fraction) as usize).max(2);
     let half_rotary = rotary_dim / 2;
-    let denom_dim = if proportional { head_dim } else { rotary_dim };
     let base_inv_freq: Vec<f64> = (0..half_rotary)
-        .map(|i| 1.0 / rope_base.powf(2.0 * i as f64 / denom_dim as f64))
+        .map(|i| 1.0 / rope_base.powf(2.0 * i as f64 / rotary_dim as f64))
         .collect();
     let inv_freq: Vec<f64> = match llama3_scaling {
         Some(scaling) => apply_llama3_inv_freq(&scaling, &base_inv_freq),
@@ -431,9 +428,9 @@ mod tests {
         // actually changes output. Use rope_base = 10_000 so the rotary
         // frequencies span the wavelength bands for our default scaling.
         let x = make_qk(4, 1, 32);
-        let base = apply_rope_partial_at_full(&x, 1, 32, 10000.0, 1.0, 0, 1.0, None, false);
+        let base = apply_rope_partial_at_full(&x, 1, 32, 10000.0, 1.0, 0, 1.0, None);
         let scaled =
-            apply_rope_partial_at_full(&x, 1, 32, 10000.0, 1.0, 0, 1.0, Some(llama3_default()), false);
+            apply_rope_partial_at_full(&x, 1, 32, 10000.0, 1.0, 0, 1.0, Some(llama3_default()));
         let differ = base
             .iter()
             .zip(scaled.iter())

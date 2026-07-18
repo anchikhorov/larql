@@ -69,7 +69,6 @@ impl<'a> StreamingContext<'a> {
                 // Per-layer geometry (Gemma 4)
                 global_head_dim: cfg.global_head_dim,
                 num_global_kv_heads: cfg.num_global_kv_heads,
-                num_global_q_heads: cfg.num_global_q_heads,
                 partial_rotary_factor: cfg.partial_rotary_factor,
                 sliding_window_pattern: cfg.sliding_window_pattern,
                 layer_types: cfg.layer_types.clone(),

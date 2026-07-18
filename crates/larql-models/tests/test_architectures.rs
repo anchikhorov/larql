@@ -576,7 +576,6 @@ fn drop_ffn_weights_removes_ffn_tensors() {
         skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
-        layer_tensors_manifest: HashMap::new(),
         embed: small.clone(),
         lm_head: small.clone(),
         position_embed: None,
@@ -659,7 +658,6 @@ fn drop_ffn_weights_removes_moe_experts() {
         skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
-        layer_tensors_manifest: HashMap::new(),
         embed: small.clone(),
         lm_head: small.clone(),
         position_embed: None,
@@ -732,7 +730,6 @@ fn drop_ffn_weights_removes_starcoder2_ffn_tensors_and_biases() {
         skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
-        layer_tensors_manifest: HashMap::new(),
         embed: small.clone(),
         lm_head: small.clone(),
         position_embed: None,
@@ -849,12 +846,12 @@ fn gemma4_rope_bases() {
 }
 
 #[test]
-fn gemma4_attention_scale_is_sqrt() {
+fn gemma4_attention_scale_is_one() {
     let arch = gemma4_e2b_arch();
-    // Gemma 4 uses QK-norm, scaled by 1/sqrt(head_dim)
-    assert_eq!(arch.attention_scale(), 1.0 / 16.0); // 1 / sqrt(256)
-    assert_eq!(arch.attention_scale_for_layer(0), 1.0 / 16.0);
-    assert_eq!(arch.attention_scale_for_layer(4), 512.0f64.powf(-0.5)); // 1 / sqrt(512)
+    // QK-norm makes explicit scaling unnecessary
+    assert_eq!(arch.attention_scale(), 1.0);
+    assert_eq!(arch.attention_scale_for_layer(0), 1.0);
+    assert_eq!(arch.attention_scale_for_layer(4), 1.0);
 }
 
 #[test]
@@ -1487,7 +1484,6 @@ fn minimal_weights() -> larql_models::ModelWeights {
         skipped_tensors: Vec::new(),
         packed_mmaps: HashMap::new(),
         packed_byte_ranges: HashMap::new(),
-        layer_tensors_manifest: HashMap::new(),
         embed: small.clone(),
         lm_head: small.clone(),
         position_embed: None,

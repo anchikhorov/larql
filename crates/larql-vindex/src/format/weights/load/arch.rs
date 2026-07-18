@@ -42,9 +42,6 @@ pub(super) fn build_arch_json(
     if let Some(v) = model_cfg.num_global_kv_heads {
         obj.insert("num_global_key_value_heads".into(), v.into());
     }
-    if let Some(v) = model_cfg.num_global_q_heads {
-        obj.insert("num_global_q_heads".into(), v.into());
-    }
     if let Some(v) = model_cfg.partial_rotary_factor {
         obj.insert("partial_rotary_factor".into(), v.into());
     }
@@ -146,7 +143,6 @@ mod tests {
             moe: None,
             global_head_dim: None,
             num_global_kv_heads: None,
-            num_global_q_heads: None,
             partial_rotary_factor: None,
             sliding_window_pattern: None,
             layer_types: None,

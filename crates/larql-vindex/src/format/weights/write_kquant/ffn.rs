@@ -4,6 +4,7 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use rayon::prelude::*;
 use larql_compute::cpu::ops::q4_common::{quantize_q4_k, quantize_q6_k};
 
 use crate::error::VindexError;
@@ -53,26 +54,30 @@ pub(super) fn write_interleaved_ffn_kquant(
 
     for layer in 0..num_layers {
         callbacks.on_layer_start(COMP_FFN_KQUANT, layer, num_layers);
-        for (i, key) in [
-            arch.ffn_gate_key(layer),
-            arch.ffn_up_key(layer),
-            arch.ffn_down_key(layer),
-        ]
-        .iter()
-        .enumerate()
-        {
-            if let Some((data, rows, cols)) = source.get_tensor(key) {
-                // Row-pad to 256 so each row aligns to a super-block boundary.
-                // Without this, matrices with `cols % 256 != 0` (e.g. Gemma 4
-                // 26B A4B's down_proj with inner dim 2112) store contiguous
-                // quantisation that every row past row 0 reads wrong. See
-                // `pad_rows_to_block` docs.
-                let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
-                // Gate (i=0) and up (i=1) always Q4_K. Down (i=2) format
-                // is controlled by `opts.down_proj` (Q6_K by default for
-                // llama.cpp compatibility, Q4_K when the caller opts in).
+
+        // Read all three FFN tensors for this layer.
+        let gate_key = arch.ffn_gate_key(layer);
+        let up_key = arch.ffn_up_key(layer);
+        let down_key = arch.ffn_down_key(layer);
+        let down_key_for_cmp = down_key.clone();
+        let gate_tensor = source.get_tensor(&gate_key);
+        let up_tensor = source.get_tensor(&up_key);
+        let down_tensor = source.get_tensor(&down_key);
+        let slots: [(String, Option<(Vec<f32>, usize, usize)>); 3] = [
+            (gate_key, gate_tensor),
+            (up_key, up_tensor),
+            (down_key, down_tensor),
+        ];
+
+        // Quantize gate/up/down in parallel — each is an independent tensor.
+        let quantized: Vec<(String, Vec<u8>, usize, usize, QuantBlockFormat, Vec<f32>)> = slots
+            .into_par_iter()
+            .enumerate()
+            .filter_map(|(i, (key, tensor))| {
+                let (data, rows, cols) = tensor?;
                 let is_down = i == 2;
                 let use_q6 = is_down && opts.down_proj == super::DownProjFormat::Q6K;
+                let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
                 let q_bytes = if use_q6 {
                     quantize_q6_k(&padded)
                 } else {
@@ -83,21 +88,26 @@ pub(super) fn write_interleaved_ffn_kquant(
                 } else {
                     QuantBlockFormat::Q4K
                 };
-                ff_file.write_all(&q_bytes)?;
-                let length = q_bytes.len() as u64;
-                ff_manifest.push(Q4kManifestEntry {
-                    key: key.clone(),
-                    shape: vec![rows, padded_cols],
-                    format: format.clone(),
-                    offset: ff_offset,
-                    length,
-                });
-                ff_offset += length;
+                Some((key, q_bytes, rows, padded_cols, format, padded))
+            })
+            .collect();
 
-                if is_down {
-                    if let Some(state) = fm_state.as_mut() {
-                        state.append_layer(key.clone(), &padded, rows, padded_cols, format)?;
-                    }
+        // Sequential write — single BufWriter with running offset.
+        for (key, q_bytes, rows, padded_cols, format, padded) in quantized {
+            ff_file.write_all(&q_bytes)?;
+            let length = q_bytes.len() as u64;
+            ff_manifest.push(Q4kManifestEntry {
+                key: key.clone(),
+                shape: vec![rows, padded_cols],
+                format: format.clone(),
+                offset: ff_offset,
+                length,
+            });
+            ff_offset += length;
+
+            if key == down_key_for_cmp {
+                if let Some(state) = fm_state.as_mut() {
+                    state.append_layer(key, &padded, rows, padded_cols, format)?;
                 }
             }
         }

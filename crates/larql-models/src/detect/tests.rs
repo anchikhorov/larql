@@ -1074,9 +1074,9 @@ fn test_detect_gemma4_31b() {
         Some("layers.5.layer_scalar".to_string())
     );
 
-    // Gemma 4 uses QK-norm, scaled by 1/sqrt(head_dim)
-    assert_eq!(arch.attention_scale_for_layer(0), 1.0 / 16.0); // 1 / sqrt(256)
-    assert_eq!(arch.attention_scale_for_layer(5), 512.0f64.powf(-0.5)); // 1 / sqrt(512)
+    // Gemma 4 uses QK-norm, so attention scale is 1.0 (no 1/sqrt(head_dim))
+    assert_eq!(arch.attention_scale_for_layer(0), 1.0);
+    assert_eq!(arch.attention_scale_for_layer(5), 1.0);
 
     // K=V flag parsed — v_shares_k() exposes it via the trait.
     // On 31B, attention_k_eq_v=true applies only to global (full_attention) layers;
@@ -1187,7 +1187,7 @@ fn test_detect_gemma4_e2b() {
 
     // V-norm, attention scale
     assert!(arch.has_v_norm());
-    assert_eq!(arch.attention_scale(), 1.0 / 16.0); // 1 / sqrt(256)
+    assert_eq!(arch.attention_scale(), 1.0);
     assert_eq!(arch.norm_weight_offset(), 0.0);
 
     // No K=V on E2B

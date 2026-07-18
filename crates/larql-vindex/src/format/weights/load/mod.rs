@@ -59,9 +59,6 @@ pub struct LoadWeightsOptions {
     /// Skip the input embedding matrix. Used by servers that only
     /// receive residual vectors, not token IDs.
     pub skip_embed: bool,
-    /// Disable zero-copy deferred loading of layer tensors and decode
-    /// them eagerly into heap memory.
-    pub eager_load_layers: bool,
 }
 
 impl LoadWeightsOptions {
@@ -294,7 +291,6 @@ mod tests {
             skip_ffn: false,
             skip_lm_head: false,
             skip_embed: false,
-            ..Default::default()
         };
         assert!(opts.should_skip("self_attn.q_proj.weight"));
         assert!(!opts.should_skip("mlp.gate_proj.weight"));
@@ -312,7 +308,6 @@ mod tests {
             skip_ffn: false,
             skip_lm_head: true,
             skip_embed: false,
-            ..Default::default()
         };
         assert!(opts.should_skip("lm_head.weight"));
         assert!(!opts.should_skip("not_lm_head.weight"));

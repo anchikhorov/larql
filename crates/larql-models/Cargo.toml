@@ -17,7 +17,6 @@ thiserror = { workspace = true }
 # Model weight loading
 safetensors = "0.7"
 memmap2 = "0.9"
-libc = "0.2"
 
 [features]
 default = []

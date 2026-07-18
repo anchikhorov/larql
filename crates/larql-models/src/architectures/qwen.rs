@@ -26,16 +26,6 @@ impl ModelArchitecture for QwenArch {
         &self.config
     }
 
-    /// Qwen weights may use `model.language_model.` prefix
-    fn key_prefixes_to_strip(&self) -> &[&str] {
-        &[
-            "model.language_model.model.",
-            "model.language_model.",
-            "language_model.model.",
-            "model.",
-        ]
-    }
-
     // ── MoE (Qwen3-MoE, Qwen2-MoE) ──
 
     fn is_moe(&self) -> bool {
@@ -90,40 +80,6 @@ impl ModelArchitecture for QwenArch {
         }
         Some(format!(
             "{}mlp.experts.{expert_id}.down_proj.weight",
-            self.layer_prefix(layer)
-        ))
-    }
-
-    fn num_shared_experts(&self) -> usize {
-        self.config.num_shared_experts.unwrap_or(1)
-    }
-
-    fn shared_expert_gate_key(&self, layer: usize) -> Option<String> {
-        if !self.is_moe() {
-            return None;
-        }
-        Some(format!(
-            "{}mlp.shared_expert.gate_proj.weight",
-            self.layer_prefix(layer)
-        ))
-    }
-
-    fn shared_expert_up_key(&self, layer: usize) -> Option<String> {
-        if !self.is_moe() {
-            return None;
-        }
-        Some(format!(
-            "{}mlp.shared_expert.up_proj.weight",
-            self.layer_prefix(layer)
-        ))
-    }
-
-    fn shared_expert_down_key(&self, layer: usize) -> Option<String> {
-        if !self.is_moe() {
-            return None;
-        }
-        Some(format!(
-            "{}mlp.shared_expert.down_proj.weight",
             self.layer_prefix(layer)
         ))
     }

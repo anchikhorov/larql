@@ -153,15 +153,8 @@ impl Session {
         let memit_results = if !memit_facts.is_empty() && config.has_model_weights && memit_enabled
         {
             let mut cb = larql_vindex::SilentLoadCallbacks;
-            let weights = larql_vindex::load_model_weights_with_opts(
-                path,
-                &mut cb,
-                larql_vindex::LoadWeightsOptions {
-                    eager_load_layers: true,
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| LqlError::exec("load weights for MEMIT", e))?;
+            let weights = larql_vindex::load_model_weights(path, &mut cb)
+                .map_err(|e| LqlError::exec("load weights for MEMIT", e))?;
             let tokenizer = larql_vindex::load_vindex_tokenizer(path)
                 .map_err(|e| LqlError::exec("load tokenizer for MEMIT", e))?;
             // `LARQL_MEMIT_TARGET_DELTA=1` switches MEMIT from the

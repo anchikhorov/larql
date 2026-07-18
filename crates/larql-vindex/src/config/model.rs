@@ -29,9 +29,6 @@ pub struct VindexModelConfig {
     /// Number of KV heads for global attention layers. If None, all layers use num_kv_heads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_global_kv_heads: Option<usize>,
-    /// Number of Q heads for global attention layers. If None, all layers use num_q_heads.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub num_global_q_heads: Option<usize>,
     /// Fraction of head_dim to apply RoPE to (0.0–1.0). If None, full rotation.
     /// Gemma 4 global layers: 0.25.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,7 +152,6 @@ impl VindexModelConfig {
             },
             global_head_dim: cfg.global_head_dim,
             num_global_kv_heads: cfg.num_global_kv_heads,
-            num_global_q_heads: cfg.num_global_q_heads,
             partial_rotary_factor: cfg.partial_rotary_factor,
             sliding_window_pattern: cfg.sliding_window_pattern,
             layer_types: cfg.layer_types.clone(),
@@ -188,7 +184,6 @@ mod tests {
             moe: None,
             global_head_dim: None,
             num_global_kv_heads: None,
-            num_global_q_heads: None,
             partial_rotary_factor: None,
             sliding_window_pattern: None,
             layer_types: None,
@@ -418,7 +413,6 @@ mod tests {
         let mut cfg = minimal_model_config();
         cfg.global_head_dim = Some(512);
         cfg.num_global_kv_heads = Some(2);
-        cfg.num_global_q_heads = Some(4);
         cfg.partial_rotary_factor = Some(0.25);
         cfg.sliding_window_pattern = Some(6);
         cfg.layer_types = Some(vec!["sliding_attention".into(), "full_attention".into()]);
@@ -436,7 +430,6 @@ mod tests {
         let back: VindexModelConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.global_head_dim, Some(512));
         assert_eq!(back.num_global_kv_heads, Some(2));
-        assert_eq!(back.num_global_q_heads, Some(4));
         assert_eq!(back.partial_rotary_factor, Some(0.25));
         assert_eq!(back.sliding_window_pattern, Some(6));
         assert_eq!(back.layer_types.as_ref().map(|v| v.len()), Some(2));

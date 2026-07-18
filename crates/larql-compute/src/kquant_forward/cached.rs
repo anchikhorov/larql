@@ -674,7 +674,6 @@ pub fn attention_decode_step_native(
         abs_position,
         pos_divisor,
         llama3,
-        arch.rope_proportional_scaling_for_layer(layer),
     );
 
     let k_vec = matvec_q4k_or_q6k_q8k(k_bytes, k_fmt, &h_norm_q8k, kv_dim, hidden)?;
@@ -712,7 +711,6 @@ pub fn attention_decode_step_native(
         abs_position,
         pos_divisor,
         llama3,
-        arch.rope_proportional_scaling_for_layer(layer),
     );
 
     let (k_concat, v_concat) = match kv_entry {

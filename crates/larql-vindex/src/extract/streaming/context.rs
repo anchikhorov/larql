@@ -156,9 +156,6 @@ impl<'a> StreamingContext<'a> {
                     .map_err(|e| VindexError::Parse(e.to_string()))?;
                 for name in st.names() {
                     let key = normalize_key(name, &prefix_refs);
-                    if key.starts_with("visual.") {
-                        continue;
-                    }
                     tensor_index.insert(key.clone(), (shard_idx, name.to_string()));
                 }
             }
