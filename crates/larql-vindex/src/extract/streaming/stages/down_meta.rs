@@ -1,7 +1,9 @@
 //! Stage 3 — down meta (streaming).
 
 use ndarray::Array2;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::sync_channel;
 use std::time::Instant;
 
 use crate::error::VindexError;
@@ -63,27 +65,32 @@ impl<'a> StreamingContext<'a> {
             let tokenizer = self.tokenizer;
             let arch = &*self.arch;
 
-                        use rayon::prelude::*;
-                        let show_timing = debug::extract_down_meta_timing();
-                        let in_flight = AtomicUsize::new(0);
-                        let max_in_flight = AtomicUsize::new(0);
-                        let t0 = Instant::now();
-                        if show_timing {
-                            eprintln!(
-                                "down_meta: {} layers × {} rayon threads starting…",
-                                num_layers,
-                                ::rayon::current_num_threads(),
-                            );
-                        }
-                        let results: Result<
-                            Vec<(usize, Vec<Option<crate::FeatureMeta>>)>,
-                            VindexError,
-                        > = (0..num_layers)
-                            .into_par_iter()
+            use rayon::prelude::*;
+            let show_timing = debug::extract_down_meta_timing();
+            let in_flight = AtomicUsize::new(0);
+            let max_in_flight = AtomicUsize::new(0);
+            let t0 = Instant::now();
+            if show_timing {
+                eprintln!(
+                    "down_meta: {} layers × {} rayon threads starting…",
+                    num_layers,
+                    ::rayon::current_num_threads(),
+                );
+            }
+            // Compute layers in parallel, but keep snapshot writes
+            // ordered and incremental. A completed later layer is
+            // held in `pending` until all preceding layers arrive.
+            let (result_tx, result_rx) = sync_channel(num_layers);
+            let in_flight_ref = &in_flight;
+            let max_in_flight_ref = &max_in_flight;
+            std::thread::scope(|scope| {
+                let compute_handle = scope.spawn(move || {
+                                (0..num_layers)
+                                    .into_par_iter()
                             .map(|layer| -> Result<_, VindexError> {
                                 if show_timing {
-                                    let cur = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-                                    max_in_flight.fetch_max(cur, Ordering::Relaxed);
+                                    let cur = in_flight_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                                    max_in_flight_ref.fetch_max(cur, Ordering::Relaxed);
                                 }
                     // ── Get down matrices for this layer ──
                     let prefix_refs: Vec<&str> =
@@ -262,28 +269,52 @@ impl<'a> StreamingContext<'a> {
                     }
 
                     if show_timing {
-                        in_flight.fetch_sub(1, Ordering::Relaxed);
+                        in_flight_ref.fetch_sub(1, Ordering::Relaxed);
                     }
 
                     Ok((layer, layer_meta))
                 })
-                .collect();
+                                    .for_each_with(result_tx, |tx, result| {
+                                        let _ = tx.send(result);
+                                    });
+                            });
 
-                        if show_timing {
-                            eprintln!(
-                                "down_meta: {:.2?} | layers: {num_layers} | max_in_flight: {} | rayon_threads: {}",
-                                t0.elapsed(),
-                                max_in_flight.load(Ordering::Relaxed),
-                                ::rayon::current_num_threads(),
-                            );
+                let mut pending = BTreeMap::new();
+                let mut next_layer = 0usize;
+                for _ in 0..num_layers {
+                    let (layer, meta) = result_rx.recv().map_err(|e| {
+                        VindexError::Parse(format!("down_meta worker stopped: {e}"))
+                    })??;
+                    pending.insert(layer, meta);
+
+                    while let Some(meta) = pending.remove(&next_layer) {
+                        self.callbacks
+                            .on_layer_start(COMP_DOWN, next_layer, num_layers);
+                        if !meta.is_empty() {
+                            all_down_meta[next_layer] = Some(meta);
                         }
-
-            let results = results?;
-            for (layer, meta) in results {
-                if !meta.is_empty() {
-                    all_down_meta[layer] = Some(meta);
+                        crate::format::down_meta::write_binary(
+                            self.output_dir,
+                            &all_down_meta,
+                            self.down_top_k,
+                        )?;
+                        self.callbacks.on_layer_done(COMP_DOWN, next_layer, 0.0);
+                        next_layer += 1;
+                    }
                 }
-            }
+                compute_handle
+                    .join()
+                    .map_err(|_| VindexError::Parse("down_meta worker panicked".to_string()))?;
+                if show_timing {
+                    eprintln!(
+                        "down_meta: {:.2?} | layers: {num_layers} | max_in_flight: {} | rayon_threads: {}",
+                        t0.elapsed(),
+                        max_in_flight.load(Ordering::Relaxed),
+                        ::rayon::current_num_threads(),
+                    );
+                }
+                Ok::<(), VindexError>(())
+            })?;
         }
 
         if !resumed_down {
